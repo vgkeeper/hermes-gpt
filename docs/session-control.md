@@ -16,7 +16,7 @@ Read-only history remains separately controlled by `HERMES_GPT_ENABLE_SESSION_SE
 ## Workflow
 
 1. Find a session ID with `hermes_session_list` when history is enabled.
-2. Call `hermes_session_continue(session_id, prompt, timeout)` or its `hermes_session_send` alias.
+2. Call `hermes_session_continue(session_id, prompt, max_job_runtime_seconds)` or its `hermes_session_send` alias.
 3. Save the returned `job_id`.
 4. Poll `hermes_session_job_status(job_id)` until the status is `completed`, `failed`, `timed_out`, or `orphaned`.
 5. Call `hermes_session_job_result(job_id)` for the bounded, redacted final output.
@@ -29,10 +29,34 @@ hermes --resume <resolved-session-id> --oneshot <prompt>
 
 No shell is used. Hermes restores the resumed session's recorded working directory using its normal CLI behavior.
 
+## Creating a new session
+
+`hermes_session_create(prompt, max_job_runtime_seconds=7200, profile="default", title=...)`
+creates a genuinely new, distinct Hermes session in the target profile and runs its
+first prompt through the same asynchronous job machinery:
+
+1. A new session row is created in the profile's Hermes session store (id shape
+   `{YYYYmmdd_HHMMSS}_{6-hex}`, explicit source `hermes-gpt`), before any CLI call.
+   An optional `title` is recorded when provided.
+2. The first work runs in that new session via the fixed CLI argument array:
+
+   ```text
+   hermes --resume <new-session-id> --oneshot <prompt>
+   ```
+
+3. The call returns immediately with `success`, `session_id`, `job_id`, `profile`
+   and `status`.
+4. Follow with `hermes_session_job_wait(job_id)` then `hermes_session_job_result(job_id)`.
+
+The new session id is generated before the CLI starts, so the returned `session_id`
+is always the id of the freshly created session. Profile is restricted through the
+same policy as `hermes_session_continue` (no arbitrary profile names); a failed
+session-store write returns `SESSION_CREATE_FAILED` without launching anything.
+
 ## Bounds and persistence
 
 - Prompt: maximum 65,536 characters.
-- Timeout: clamped to 10–3600 seconds; default 900.
+- Max job runtime: `max_job_runtime_seconds` clamped to 10–7,200 seconds; default 7,200. Independent of `hermes_session_job_wait` (max 120 s per poll, never kills).
 - Returned result: clamped to 500–24,000 characters.
 - Concurrency: only one session-control job may run for a given session at a time.
 - Job metadata: stored under the Hermes data root in `session-jobs/`.
@@ -44,4 +68,4 @@ Session control can consume the configured provider's quota or incur provider ch
 
 ## Validation without a real model call
 
-The automated tests replace process launch with a fake Hermes process. They verify the fixed CLI arguments, `shell=False`, prompt-free metadata, timeout bounds, restart reconciliation, redaction, tool registration gates, and status/result flow. The test suite does not resume a real session or contact a model provider.
+The automated tests replace process launch with a fake Hermes process. They verify the fixed CLI arguments, `shell=False`, prompt-free metadata, runtime-limit bounds, restart reconciliation, redaction, tool registration gates, and status/result flow. The test suite does not resume a real session or contact a model provider.
