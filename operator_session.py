@@ -373,7 +373,7 @@ def _create_session_in_db(
     if SessionDB is None:
         raise RuntimeError("Hermes session database is unavailable: SessionDB is not injected.")
     profile_home = Path(op.resolve_profile_home(profile, _hermes_data_root(hermes_root)))
-    db = SessionDB(db_path=str(profile_home / "state.db"), read_only=False)
+    db = SessionDB(db_path=profile_home / "state.db", read_only=False)
     try:
         db.create_session(session_id, source=SESSION_CREATE_SOURCE)
         if title:
