@@ -81,6 +81,21 @@ def test_build_server_extends_transport_allowlist_from_env(monkeypatch):
     assert "127.0.0.1" in allowed
 
 
+def test_asgi_app_does_not_register_browser_ui_routes(monkeypatch):
+    clear_gate_envs(monkeypatch)
+    monkeypatch.setenv("HERMES_GPT_UI_ENABLED", "1")
+
+    app = server.build_asgi_app(server.build_server(http=True), http=True)
+    # CORSMiddleware -> bearer middleware -> Starlette route table.
+    routes = app.app.app.routes
+    paths = {getattr(route, "path", "") for route in routes}
+
+    assert not any(path == "/ui" or path.startswith("/api/") for path in paths)
+    assert "/events/ws" in paths
+    assert "/" in paths
+    assert isinstance(routes[-1], server.Mount)
+
+
 def test_default_tool_surface_is_read_or_local_metadata_only(monkeypatch):
     clear_gate_envs(monkeypatch)
 
@@ -105,6 +120,7 @@ def test_default_tool_surface_is_read_or_local_metadata_only(monkeypatch):
         "hermes_session_search",
         "hermes_session_continue",
         "hermes_session_send",
+        "hermes_session_create",
         "hermes_bot_chat_send",
         "hermes_session_job_status",
         "hermes_session_job_result",
@@ -161,9 +177,11 @@ def test_env_gates_expose_high_risk_tools(monkeypatch):
     assert "hermes_session_search" in names
     assert "hermes_session_continue" in names
     assert "hermes_session_send" in names
+    assert "hermes_session_create" in names
     assert "hermes_bot_chat_send" in names
     assert "hermes_session_job_status" in names
     assert "hermes_session_job_result" in names
+    assert "hermes_session_job_wait" in names
     assert "hermes_vision_analyze" in names
     assert "hermes_web_search" in names
     assert "hermes_web_extract" in names
@@ -922,19 +940,19 @@ def test_session_continue_resolves_id_before_runner_dispatch(monkeypatch, tmp_pa
     monkeypatch.setattr(server, "_default_hermes_root", lambda: tmp_path)
     dispatched = {}
 
-    def fake_continue(session_id, prompt, timeout, **kwargs):
+    def fake_continue(session_id, prompt, max_job_runtime_seconds, **kwargs):
         dispatched.update(
-            session_id=session_id, prompt=prompt, timeout=timeout, **kwargs
+            session_id=session_id, prompt=prompt, max_job_runtime_seconds=max_job_runtime_seconds, **kwargs
         )
         return {"success": True, "job_id": "a" * 32, "status": "running"}
 
     monkeypatch.setattr(server.op_session, "hermes_session_continue", fake_continue)
-    result = server.hermes_session_continue("prefix", "continue safely", timeout=123)
+    result = server.hermes_session_continue("prefix", "continue safely", max_job_runtime_seconds=123)
 
     assert result["success"] is True
     assert dispatched["session_id"] == "session-1"
     assert dispatched["prompt"] == "continue safely"
-    assert dispatched["timeout"] == 123
+    assert dispatched["max_job_runtime_seconds"] == 123
     assert dispatched["hermes_root"] == tmp_path
     assert dispatched["profile"] == "default"
     with pytest.raises(sqlite3.ProgrammingError):
@@ -951,9 +969,9 @@ def test_session_continue_resolves_id_in_requested_profile(monkeypatch, tmp_path
     monkeypatch.setattr(server, "_default_hermes_root", lambda: tmp_path)
     dispatched = {}
 
-    def fake_continue(session_id, prompt, timeout, **kwargs):
+    def fake_continue(session_id, prompt, max_job_runtime_seconds, **kwargs):
         dispatched.update(
-            session_id=session_id, prompt=prompt, timeout=timeout, **kwargs
+            session_id=session_id, prompt=prompt, max_job_runtime_seconds=max_job_runtime_seconds, **kwargs
         )
         return {"success": True, "job_id": "b" * 32, "status": "running"}
 
@@ -961,7 +979,7 @@ def test_session_continue_resolves_id_in_requested_profile(monkeypatch, tmp_path
     result = server.hermes_session_continue(
         "prefix",
         "send to project manager",
-        timeout=60,
+        max_job_runtime_seconds=60,
         profile="project-manager",
     )
 
@@ -970,6 +988,41 @@ def test_session_continue_resolves_id_in_requested_profile(monkeypatch, tmp_path
     assert dispatched["profile"] == "project-manager"
     with pytest.raises(sqlite3.ProgrammingError):
         connection.execute("select 1")
+
+
+def test_session_create_dispatches_to_runner_with_new_session(monkeypatch, tmp_path):
+    monkeypatch.setenv(server.ENABLE_SESSION_CONTROL_ENV, "1")
+    monkeypatch.setattr(server, "require_imports", lambda: None)
+    monkeypatch.setattr(server, "_default_hermes_root", lambda: tmp_path)
+    dispatched = {}
+
+    def fake_create(prompt, max_job_runtime_seconds, **kwargs):
+        dispatched.update(prompt=prompt, max_job_runtime_seconds=max_job_runtime_seconds, **kwargs)
+        return {
+            "success": True,
+            "job_id": "d" * 32,
+            "session_id": "20260923_120000_abcdef",
+            "profile": "default",
+            "status": "running",
+        }
+
+    monkeypatch.setattr(server.op_session, "hermes_session_create", fake_create)
+    result = server.hermes_session_create(
+        "first work", max_job_runtime_seconds=300, title="A fresh session"
+    )
+    assert result["success"] is True
+    assert dispatched["prompt"] == "first work"
+    assert dispatched["max_job_runtime_seconds"] == 300
+    assert dispatched["hermes_root"] == tmp_path
+    assert dispatched["profile"] == "default"
+    assert dispatched["title"] == "A fresh session"
+
+
+def test_session_create_disabled_without_env_gate(monkeypatch):
+    monkeypatch.delenv(server.ENABLE_SESSION_CONTROL_ENV, raising=False)
+    monkeypatch.setattr(server, "require_imports", lambda: None)
+    result = server.hermes_session_create("first work")
+    assert result["code"] == "SESSION_CONTROL_DISABLED"
 
 
 def test_bot_chat_send_targets_current_tip_in_requested_profile(monkeypatch):
@@ -997,11 +1050,11 @@ def test_bot_chat_send_targets_current_tip_in_requested_profile(monkeypatch):
     monkeypatch.setattr(server, "SessionDB", lambda **kwargs: fake_db)
     dispatched = {}
 
-    def fake_continue(session_id, prompt, timeout=900, profile="default"):
+    def fake_continue(session_id, prompt, max_job_runtime_seconds=900, profile="default"):
         dispatched.update(
             session_id=session_id,
             prompt=prompt,
-            timeout=timeout,
+            max_job_runtime_seconds=max_job_runtime_seconds,
             profile=profile,
         )
         return {"success": True, "job_id": "c" * 32, "status": "running"}
@@ -1010,14 +1063,14 @@ def test_bot_chat_send_targets_current_tip_in_requested_profile(monkeypatch):
     result = server.hermes_bot_chat_send(
         "handoff from ChatGPT",
         profile="project-manager",
-        timeout=321,
+        max_job_runtime_seconds=321,
     )
 
     assert result["success"] is True
     assert dispatched == {
         "session_id": "bot-current",
         "prompt": "handoff from ChatGPT",
-        "timeout": 321,
+        "max_job_runtime_seconds": 321,
         "profile": "project-manager",
     }
     with pytest.raises(sqlite3.ProgrammingError):
@@ -1588,7 +1641,7 @@ def test_v09_connector_surface_acceptance(monkeypatch):
     assert len(set(names)) == len(names), "duplicate tool registration"
 
     # serverInfo.version must track the checkout version, not the SDK version.
-    assert (built.version if hasattr(built, "version") else built._mcp_server.version) == versioning.VERSION == "0.10.0"
+    assert (built.version if hasattr(built, "version") else built._mcp_server.version) == versioning.VERSION == "0.12.0"
 
 
 def test_history_enabled_connector_surface_acceptance(monkeypatch):
@@ -1621,4 +1674,25 @@ def test_history_enabled_connector_surface_acceptance(monkeypatch):
         schema = enabled_by_name[name].model_dump(by_alias=True)["inputSchema"]
         assert schema["properties"]["profile"]["default"] == "default"
 
-    assert (enabled.version if hasattr(enabled, "version") else enabled._mcp_server.version) == versioning.VERSION == "0.10.0"
+    assert (enabled.version if hasattr(enabled, "version") else enabled._mcp_server.version) == versioning.VERSION == "0.12.0"
+
+def test_session_continue_schema_exposes_max_job_runtime(monkeypatch):
+    clear_gate_envs(monkeypatch)
+    monkeypatch.setenv(server.ENABLE_SESSION_CONTROL_ENV, "1")
+    srv = server.build_server()
+    tools = asyncio.run(srv.list_tools())
+    by_name = {}
+    for t in tools:
+        by_name[t.name] = t.model_dump(by_alias=True)["inputSchema"]
+    cont = by_name["hermes_session_continue"]
+    props = cont["properties"]
+    assert "timeout" not in props
+    rt = props["max_job_runtime_seconds"]
+    assert rt["default"] == server.DEFAULT_SESSION_MAX_RUNTIME_SECONDS
+    assert rt["maximum"] == server.DEFAULT_SESSION_MAX_RUNTIME_SECONDS
+    assert rt["minimum"] == server.op_session.MIN_JOB_RUNTIME_SECONDS
+    assert "job_wait" in rt["description"]
+    wait = by_name["hermes_session_job_wait"]["properties"]["wait_seconds"]
+    assert wait["default"] == 120
+    assert "wait_seconds" not in props
+    assert "max_job_runtime_seconds" not in by_name["hermes_session_job_wait"]["properties"]

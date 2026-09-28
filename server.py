@@ -12,7 +12,9 @@ import sqlite3
 import sys
 import urllib.parse
 from pathlib import Path
-from typing import Any, List
+from typing import Annotated, Any, List
+
+from pydantic import Field
 
 from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
@@ -80,7 +82,7 @@ MAX_QUERY_LENGTH = 512
 MAX_RESPONSE_BYTES = 262_144
 MAX_MESSAGE_SCAN_ROWS = 1_000
 DEFAULT_SESSION_OFFSET = 0
-DEFAULT_SESSION_TIMEOUT = 900
+DEFAULT_SESSION_MAX_RUNTIME_SECONDS = 7_200
 
 _DEFAULT_MESSAGE_ROLES = {"user", "assistant"}
 _INTERNAL_MESSAGE_ROLES = {"system", "tool", "function"}
@@ -249,6 +251,7 @@ def import_hermes() -> None:
 
             SessionDB = SDB
             get_hermes_home = ghh
+            op_session.SessionDB = SDB
         except Exception as exc:
             eprint(f"hermes-gpt: session search unavailable: {exc}")
     except Exception as exc:
@@ -993,7 +996,7 @@ def hermes_bot_chat_get(profile: str = "default") -> str:
 def hermes_bot_chat_send(
     prompt: str,
     profile: str = "default",
-    timeout: int = 900,
+    max_job_runtime_seconds: int = DEFAULT_SESSION_MAX_RUNTIME_SECONDS,
 ) -> dict[str, Any]:
     """Send one bounded turn directly to a profile's canonical Bot Chat."""
     safe_profile = _validate_session_profile(profile)
@@ -1019,8 +1022,8 @@ def hermes_bot_chat_send(
         return hermes_session_continue(
             resolved["current_session_id"],
             prompt,
-            timeout,
-            safe_profile,
+            max_job_runtime_seconds=max_job_runtime_seconds,
+            profile=safe_profile,
         )
     except Exception as exc:
         return op_policy.make_error_envelope(
@@ -1295,7 +1298,18 @@ def hermes_session_search(
 def hermes_session_continue(
     session_id: str,
     prompt: str,
-    timeout: int = DEFAULT_SESSION_TIMEOUT,
+    max_job_runtime_seconds: Annotated[
+        int,
+        Field(
+            description=(
+                "Durée maximale du travail Hermes en secondes : à expiration, Hermes"
+                " et ses enfants sont arrêtés. Sans rapport avec hermes_session_job_wait"
+                " (max 120 s, ne tue jamais le job)."
+            ),
+            ge=op_session.MIN_JOB_RUNTIME_SECONDS,
+            le=DEFAULT_SESSION_MAX_RUNTIME_SECONDS,
+        ),
+    ] = DEFAULT_SESSION_MAX_RUNTIME_SECONDS,
     profile: str = "default",
 ) -> dict[str, Any]:
     """Start one bounded, asynchronous turn in an existing Hermes session for a profile."""
@@ -1307,7 +1321,7 @@ def hermes_session_continue(
             return op_session.hermes_session_continue(
                 session_id,
                 prompt,
-                timeout,
+                max_job_runtime_seconds=max_job_runtime_seconds,
                 hermes_root=_default_hermes_root(),
                 agent_root=HERMES_ROOT,
                 profile=safe_profile,
@@ -1324,7 +1338,7 @@ def hermes_session_continue(
         return op_session.hermes_session_continue(
             resolved_id,
             prompt,
-            timeout,
+            max_job_runtime_seconds=max_job_runtime_seconds,
             hermes_root=_default_hermes_root(),
             agent_root=HERMES_ROOT,
             profile=safe_profile,
@@ -1343,11 +1357,70 @@ def hermes_session_continue(
 def hermes_session_send(
     session_id: str,
     prompt: str,
-    timeout: int = DEFAULT_SESSION_TIMEOUT,
+    max_job_runtime_seconds: Annotated[int, Field(
+        description="Durée maximale du travail Hermes en secondes : à expiration, Hermes et ses enfants sont arrêtés. Sans rapport avec hermes_session_job_wait.",
+        ge=op_session.MIN_JOB_RUNTIME_SECONDS,
+        le=DEFAULT_SESSION_MAX_RUNTIME_SECONDS,
+    )] = DEFAULT_SESSION_MAX_RUNTIME_SECONDS,
     profile: str = "default",
 ) -> dict[str, Any]:
     """Alias for profile-aware hermes_session_continue for clients that use send terminology."""
-    return hermes_session_continue(session_id, prompt, timeout, profile)
+    return hermes_session_continue(
+        session_id,
+        prompt,
+        max_job_runtime_seconds=max_job_runtime_seconds,
+        profile=profile,
+    )
+
+
+def hermes_session_create(
+    prompt: str,
+    max_job_runtime_seconds: Annotated[
+        int,
+        Field(
+            description=(
+                "Durée maximale du travail Hermes en secondes : à expiration, Hermes"
+                " et ses enfants sont arrêtés. Borne de 10 à 7200 inclus."
+            ),
+            ge=op_session.MIN_JOB_RUNTIME_SECONDS,
+            le=DEFAULT_SESSION_MAX_RUNTIME_SECONDS,
+        ),
+    ] = DEFAULT_SESSION_MAX_RUNTIME_SECONDS,
+    profile: str = "default",
+    title: str | None = None,
+) -> dict[str, Any]:
+    """Create a new Hermes session and start its first work asynchronously.
+
+    Creates a genuinely new, distinct session in the target profile and runs
+    its first prompt through the same job machinery as
+    ``hermes_session_continue``. Follow with ``hermes_session_job_wait`` then
+    ``hermes_session_job_result``.
+    """
+    safe_profile = _validate_session_profile(profile)
+    try:
+        require_imports()
+        if not env_enabled(ENABLE_SESSION_CONTROL_ENV):
+            return op_policy.make_error_envelope(
+                layer="session_control",
+                code="SESSION_CONTROL_DISABLED",
+                safe_message="Hermes session control is disabled.",
+                suggested_action=f"Set {ENABLE_SESSION_CONTROL_ENV}=1 on the trusted local MCP server.",
+            )
+        return op_session.hermes_session_create(
+            prompt,
+            max_job_runtime_seconds=max_job_runtime_seconds,
+            hermes_root=_default_hermes_root(),
+            agent_root=HERMES_ROOT,
+            profile=safe_profile,
+            title=title,
+        )
+    except Exception as exc:
+        return op_policy.make_error_envelope(
+            layer="session_control",
+            code="SESSION_CREATE_FAILED",
+            safe_message=_redact_error(exc),
+            suggested_action="Check the Hermes session database, profile, and local CLI installation.",
+        )
 
 
 def hermes_session_job_status(job_id: str) -> dict[str, Any]:
@@ -1360,6 +1433,20 @@ def hermes_session_job_result(
 ) -> dict[str, Any]:
     """Return the bounded, redacted response from a Hermes session-control job."""
     return op_session.hermes_session_job_result(job_id, max_chars, _default_hermes_root())
+
+
+def hermes_session_job_result_page(
+    job_id: str, offset: int = 0, max_bytes: int = 4096
+) -> dict[str, Any]:
+    """Return one page (byte range, UTF-8 safe) of a session-control job result."""
+    return op_session.hermes_session_job_result_page(job_id, offset, max_bytes, _default_hermes_root())
+
+
+def hermes_session_job_wait(
+    job_id: str, wait_seconds: int = op_session.MAX_JOB_WAIT_SECONDS
+) -> dict[str, Any]:
+    """Long-poll a Hermes session-control job to terminal state (max 120s)."""
+    return op_session.hermes_session_job_wait(job_id, wait_seconds, _default_hermes_root())
 
 
 # ---------------------------------------------------------------------------
@@ -2593,25 +2680,37 @@ def hermes_controller_plan_list(mission_id: str, limit: int = 50) -> str:
 def hermes_controller_reconcile(
     mission_id: str,
     trigger_kind: str = "T5_manual",
+    confirm: bool = False,
     dry_run: bool = True,
 ) -> str:
-    """Run one shadow pass over a mission (observe → classify → smallest action).
+    """Run one controller reconciler pass (observe → classify → smallest action).
 
-    Decision output only (§17 item 6 / §7): the controller observes authoritative
+    L0/L1 (default): the controller observes authoritative
     mission/plan/delegation/runner state, classifies it via the Ops 8-class
-    taxonomy, and emits the smallest recovery action as a *proposal* —
-    ``would_execute`` is always False and the returned envelope carries the
-    ``would_be_commands`` a higher-autonomy rung would run (D10: not this slice).
+    taxonomy, and emits the smallest recovery action — nothing is dispatched.
 
     ``dry_run=True`` (default) is a truthful preview: no durable writes to any
     mission/plan/delegation/controller state (only the repo-wide Operator
     audit trail every tool call produces).
     ``dry_run=False`` records the pass (controller_plan + controller_telemetry
     + pass lease + heartbeat) and requires workspace level with direct apply
-    mode. Nothing is dispatched, completed, or approved in either mode.
+    mode.
+
+    L2 rung (opt-in, v0.12 slice-2): when the machine gate
+    ``HERMES_GPT_CONTROLLER_EXECUTE=1`` is set AND ``confirm=True`` here AND the
+    live policy is enabled with direct apply mode at workspace level, the pass
+    EXECUTES its single smallest action (a dispatch) through the existing
+    work-contract/delegation authority surface, keyed idempotently. Every other
+    combination stays decision-only with ``would_execute`` False and an additive
+    ``execution`` block naming the stable refusal reason. The rung never
+    completes, approves, weakens evidence, replans, or retries unboundedly.
     """
     return op_controller.hermes_controller_reconcile(
-        mission_id, trigger_kind, dry_run=dry_run, hermes_root=_default_hermes_root()
+        mission_id,
+        trigger_kind,
+        confirm=confirm,
+        dry_run=dry_run,
+        hermes_root=_default_hermes_root(),
     )
 
 
@@ -3087,24 +3186,8 @@ def build_asgi_app(server: FastMCP, *, http: bool) -> Any:
                 Route("/oauth/token", token, methods=["POST"]),
             ]
         )
-    # Mount browser UI routes before the MCP catch-all. The UI remains opt-in
-    # and a missing optional UI module must not change the MCP-only server.
-    ui_enabled = False
-    try:
-        import ui_security as _ui_security
-
-        ui_enabled = _ui_security.ui_enabled()
-    except Exception:  # noqa: BLE001
-        ui_enabled = os.environ.get("HERMES_GPT_UI_ENABLED") == "1"
-    if ui_enabled:
-        try:
-            import ui_api
-
-            routes.extend(ui_api.routes())
-        except Exception as exc:  # noqa: BLE001
-            eprint(f"UI mount skipped: {exc.__class__.__name__}: {exc}")
     # v0.9 live-event delivery is read-only and remains behind the same outer
-    # Bearer/OAuth middleware as MCP and the browser UI.
+    # Bearer/OAuth middleware as MCP.
     routes.extend(
         op_live_events.websocket_routes(
             _default_hermes_root,
@@ -3202,10 +3285,13 @@ def register_tools(server: FastMCP) -> None:
     if env_enabled(ENABLE_SESSION_CONTROL_ENV):
         server.add_tool(hermes_session_continue, meta=tool_meta())
         server.add_tool(hermes_session_send, meta=tool_meta())
+        server.add_tool(hermes_session_create, meta=tool_meta())
         if env_enabled(ENABLE_SESSION_SEARCH_ENV):
             server.add_tool(hermes_bot_chat_send, meta=tool_meta())
         server.add_tool(hermes_session_job_status, meta=tool_meta())
         server.add_tool(hermes_session_job_result, meta=tool_meta())
+        server.add_tool(hermes_session_job_result_page, meta=tool_meta())
+        server.add_tool(hermes_session_job_wait, meta=tool_meta())
     if env_enabled(ENABLE_VISION_ENV):
         server.add_tool(hermes_vision_analyze, meta=tool_meta())
     if env_enabled(ENABLE_WEB_ENV):

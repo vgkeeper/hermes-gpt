@@ -812,13 +812,15 @@ def _find_secret_files(workdir: Path) -> list[str]:
                 rel_candidate = candidate.relative_to(workdir)
             except ValueError:
                 rel_candidate = None
+            # These exact files are design-token source assets in audited WebUI
+            # repositories, not secret-bearing token data files.
+            if rel_candidate in allowed_source_paths:
+                continue
             # The substring heuristic targets secret-bearing data files
             # (tokens.json, oauth-store.json, credentials.yaml, ...). Python
             # source and markdown docs are legitimate even when their names
-            # contain "oauth"/"token"/"secret". The two known web design-token
-            # source assets are separately allowlisted by exact repository path;
-            # similarly named files elsewhere remain subject to the scan.
-            if lower.endswith((".py", ".md")) or rel_candidate in allowed_source_paths:
+            # contain "oauth"/"token"/"secret".
+            if lower.endswith((".py", ".md")):
                 continue
             for sub in secret_substrings:
                 if sub in lower:

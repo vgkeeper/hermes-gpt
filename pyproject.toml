@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-gpt"
-version = "0.10.0"
+version = "0.12.0"
 description = "Local-dev MCP sidecar for exposing selected Hermes Agent capabilities."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -89,12 +89,6 @@ py-modules = [
   "updater",
   "versioning",
   "hermes_state",
-  "ui_api",
-  "ui_security",
-  "ui_chat",
-  "ui_ops",
-  "ui_fabric",
-  "ui_missions",
 ]
 
 [tool.setuptools.data-files]
@@ -130,9 +124,8 @@ py-modules = [
   "docs/release-notes-v0.8.0.md",
   "docs/retention-policy.md",
   "docs/windows-chatgpt-codex.md",
-  "docs/ui-security-boundary.md",
-  "docs/flight-deck-coverage.md",
   "docs/flight-deck-missions.md",
+  "docs/gemini-spark.md",
 ]
 "share/hermes-gpt/examples" = [
   "examples/start-hermes-gpt.example.ps1",

@@ -2,28 +2,18 @@
 
 The suite historically read the developer's real ``~/.hermes/config.yaml``
 during fleet/swarm/contract tests (via ``operator_fleet._load_hermes_config``
--> ``hermes_cli`` config resolution) and ``test_ui_chat`` poisoned ``sys.path``
-for every later module by inserting the real Hermes agent source root at
-collection time. These tests pin both isolation properties:
+-> ``hermes_cli`` config resolution). These tests pin the isolation property:
 
 1. under the default test environment the fleet registry must see NO peers
    (the hermetic sandbox has no ``a2a_agents`` config);
-2. importing ``test_ui_chat`` in a clean interpreter must not add any path
-   outside the repository to ``sys.path`` (and must not make ``hermes_cli``
-   importable).
 """
 
 from __future__ import annotations
 
-import json
 import os
-import subprocess
-import sys
 from pathlib import Path
 
 import operator_fleet
-
-REPO = Path(__file__).resolve().parent
 
 
 def test_fleet_registry_reads_no_real_machine_peers_under_default_test_env():
@@ -66,39 +56,3 @@ def test_token_keys_stay_in_the_sandbox(tmp_path):
     assert source == "keyfile"
     assert len(key) == 32
     assert token_store.key_file_path(tmp_path).is_file()
-
-
-def test_importing_test_ui_chat_does_not_inject_outside_paths():
-    """test_ui_chat collection must not mutate global sys.path beyond the repo."""
-    code = (
-        "import sys, json\n"
-        f"sys.path.insert(0, {str(REPO)!r})\n"
-        "before = list(sys.path)\n"
-        "import test_ui_chat\n"
-        "print(json.dumps([p for p in sys.path if p not in before]))\n"
-        "print(json.dumps(sorted(m for m in sys.modules if m == 'hermes_cli')))\n"
-    )
-    env = dict(os.environ)
-    env.pop("PYTHONPATH", None)
-    env.pop("HERMES_HOME", None)
-    env.pop("HERMES_PROFILE", None)
-    proc = subprocess.run(
-        [sys.executable, "-c", code],
-        capture_output=True,
-        check=False,
-        text=True,
-        timeout=60,
-        env=env,
-        cwd=str(REPO),
-    )
-    assert proc.returncode == 0, proc.stderr
-    lines = proc.stdout.splitlines()
-    imported_sys_path = json.loads(lines[0])
-    hermes_cli_modules = json.loads(lines[1])
-    outside = [
-        p
-        for p in imported_sys_path
-        if ".hermes" in p and not p.startswith(str(REPO))
-    ]
-    assert not outside, f"test_ui_chat import injected non-repo paths: {outside}"
-    assert hermes_cli_modules == [], "test_ui_chat import made hermes_cli importable"
