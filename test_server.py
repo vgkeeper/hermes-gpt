@@ -1683,10 +1683,7 @@ def test_session_continue_schema_exposes_max_job_runtime(monkeypatch):
     tools = asyncio.run(srv.list_tools())
     by_name = {}
     for t in tools:
-        s = t.input_schema
-        if hasattr(s, "model_dump"):
-            s = s.model_dump()
-        by_name[t.name] = s
+        by_name[t.name] = t.model_dump(by_alias=True)["inputSchema"]
     cont = by_name["hermes_session_continue"]
     props = cont["properties"]
     assert "timeout" not in props

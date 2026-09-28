@@ -15,6 +15,7 @@ from pathlib import Path
 
 import operator_fleet
 
+
 def test_fleet_registry_reads_no_real_machine_peers_under_default_test_env():
     """No test may observe the invoking machine's real a2a_agents config."""
     peers = operator_fleet._a2a_peers()
