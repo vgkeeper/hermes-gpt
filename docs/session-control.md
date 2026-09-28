@@ -31,19 +31,7 @@ No shell is used. Hermes restores the resumed session's recorded working directo
 
 ## Creating a new session
 
-```text
-hermes_session_create(
-    prompt,
-    max_job_runtime_seconds=7200,
-    profile="default",
-    title=...,
-)
-```
-creates a genuinely new, distinct Hermes session in the target profile and runs its
-first prompt through the same asynchronous job machinery:
-
-The default profile is `default`. The maximum job runtime is 7,200 seconds, which
-is also the default runtime bound.
+`hermes_session_create` creates a genuinely new, distinct Hermes session in the target profile and runs its first prompt through the same asynchronous job machinery. Its maximum job runtime is 7,200 seconds, and the default runtime is also 7,200 seconds. The default profile is `default`.
 
 1. A new session row is created in the profile's Hermes session store (id shape
    `{YYYYmmdd_HHMMSS}_{6-hex}`, explicit source `hermes-gpt`), before any CLI call.
