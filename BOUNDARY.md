@@ -14,7 +14,9 @@ existing primitive.
 - Provider / inference routing, cron, audit, secret-path policy, workspace confinement.
 - Sidecar: Missions durable lifecycle, Work Contracts, Swarm DAG, Fabric cross-machine
   execution, Fleet A2A + authority manifest, Delegations lineage, Events / live-events,
-  review evidence, recovery / diagnostics, token store, Flight Deck presentation.
+  review evidence, recovery / diagnostics, token store, and MCP Operator/Fleet
+  surfaces. The former browser Flight Deck presentation was removed; historical
+  browser designs and release records do not describe a shipped runtime UI.
 - The Operator authority model (levels, apply mode, confirm, owner ack, secret deny)
   and the Mission Control redaction / data-boundary invariants.
 - A new execution engine or new agent intelligence; a second judge stack; a separate

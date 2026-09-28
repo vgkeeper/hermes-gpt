@@ -1,4 +1,6 @@
-# Flight Deck Missions (v0.9)
+# Historical: Flight Deck Missions (v0.9)
+
+Status: historical. The browser-only Flight Deck and its Operations Bridge routes have been removed. This document records the former UI behavior; current Mission lifecycle and authorization are documented in [Missions](missions.md) and [Operator Mode](operator-mode.md).
 
 Flight Deck exposes first-class Missions as a read-only operational view. The browser does not gain Mission mutation, dispatch, cancellation, reconciliation, or approval authority.
 

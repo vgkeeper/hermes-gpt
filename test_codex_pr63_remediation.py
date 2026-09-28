@@ -1206,8 +1206,7 @@ def test_revoke_rotation_happens_after_commit(tmp_path: Path):
 
 
 def test_rotation_and_issuance_are_serialized(tmp_path: Path):
-    """A grant committing concurrently with revoke+rotate must never end up
-    encrypted under a key that rotation just discarded."""
+    """Concurrent commits around revoke+rotate obey the epoch fence."""
     import threading
 
     root = tmp_path / "hermes"
@@ -1220,61 +1219,104 @@ def test_rotation_and_issuance_are_serialized(tmp_path: Path):
     state.access_tokens[seed] = si
     state.persist_tokens(root)
 
-    outcomes = {"issued": 0, "fenced": 0, "errors": 0}
-    grant_values: list[str] = []
+    issuer_count = 3
+    old_committed = threading.Barrier(issuer_count + 1)
+    stale_fenced = threading.Barrier(issuer_count)
+    current_start = threading.Barrier(issuer_count)
+    rotated = threading.Event()
     lock = threading.Lock()
+    attempts: list[tuple[str, int, str, str]] = []
+    errors: list[Exception] = []
+    revoke_result: dict[str, object] = {}
+
+    def attempt(phase: str, source_epoch: int) -> None:
+        value, item = state._new_access_token(
+            client_id=config.client_id, scope=config.scope, resource=config.resource
+        )
+        try:
+            token_store.commit_tokens(
+                root,
+                source_epoch=source_epoch,
+                issue={
+                    token_store.issue_key("access", value): {
+                        "client_id": config.client_id,
+                        "scope": config.scope,
+                        "resource": config.resource,
+                        "expires_at": item["expires_at"],
+                        "_kind": "access",
+                        "_token_value": value,
+                    }
+                },
+            )
+            result = "committed"
+        except token_store.TokenStoreError:
+            result = "fenced"
+        except Exception as exc:  # pragma: no cover - asserted below
+            result = "error"
+            with lock:
+                errors.append(exc)
+        with lock:
+            attempts.append((phase, source_epoch, value, result))
 
     def issuer() -> None:
-        st = oauth_auth.OAuthState(config)
-        st.restore_tokens(root)
-        for _ in range(5):
-            value, item = st._new_access_token(
-                client_id=config.client_id, scope=config.scope, resource=config.resource
-            )
-            try:
-                token_store.commit_tokens(
-                    root,
-                    source_epoch=token_store.read_revocation_epoch(root),
-                    issue={
-                        token_store.issue_key("access", value): {
-                            "client_id": config.client_id,
-                            "scope": config.scope,
-                            "resource": config.resource,
-                            "expires_at": item["expires_at"],
-                            "_kind": "access",
-                            "_token_value": value,
-                        }
-                    },
-                )
-                with lock:
-                    outcomes["issued"] += 1
-                    grant_values.append(value)
-            except token_store.TokenStoreError:
-                with lock:
-                    outcomes["fenced"] += 1
-            except Exception:
-                with lock:
-                    outcomes["errors"] += 1
+        try:
+            attempt("old", 0)
+            old_committed.wait(timeout=10)
+            assert rotated.wait(timeout=10)
+            attempt("stale", 0)
+            stale_fenced.wait(timeout=10)
+            current_start.wait(timeout=10)
+            attempt("current", token_store.read_revocation_epoch(root))
+        except Exception as exc:  # pragma: no cover - asserted below
+            with lock:
+                errors.append(exc)
+            for barrier in (old_committed, stale_fenced, current_start):
+                try:
+                    barrier.abort()
+                except Exception:
+                    pass
 
     def revoker() -> None:
-        token_store.revoke_tokens(root, rotate_key=True)
+        try:
+            old_committed.wait(timeout=10)
+            revoke_result.update(token_store.revoke_tokens(root, rotate_key=True))
+            rotated.set()
+        except Exception as exc:  # pragma: no cover - asserted below
+            with lock:
+                errors.append(exc)
 
-    threads = [threading.Thread(target=issuer) for _ in range(3)]
+    issuers = [threading.Thread(target=issuer) for _ in range(issuer_count)]
     rev = threading.Thread(target=revoker)
-    for t in threads:
-        t.start()
+    for thread in issuers:
+        thread.start()
     rev.start()
-    for t in threads:
-        t.join()
-    rev.join()
+    for thread in issuers:
+        thread.join(timeout=20)
+    rev.join(timeout=20)
+    assert all(not thread.is_alive() for thread in [*issuers, rev])
+    assert not errors, [type(exc).__name__ for exc in errors]
 
-    assert outcomes["errors"] == 0, outcomes
-    # Every credential that committed must still be readable (correct key),
-    # and the revoked seed must be dead.
-    for value in grant_values:
-        assert token_store.lookup_token(root, "access", value) is not None, (
-            "issued token unreadable after concurrent rotation"
-        )
+    final_epoch = token_store.read_revocation_epoch(root)
+    assert final_epoch == 1
+    assert revoke_result["revoked"] is True
+    assert revoke_result["epoch"] == final_epoch
+    assert revoke_result["key_rotated"] is True
+    assert len(attempts) == issuer_count * 3
+    old = [entry for entry in attempts if entry[0] == "old"]
+    stale = [entry for entry in attempts if entry[0] == "stale"]
+    current = [entry for entry in attempts if entry[0] == "current"]
+    assert len(old) == len(stale) == len(current) == issuer_count
+    assert all(epoch == 0 and result == "committed" for _, epoch, _, result in old)
+    assert all(epoch == 0 and result == "fenced" for _, epoch, _, result in stale)
+    assert all(epoch == final_epoch and result == "committed" for _, epoch, _, result in current)
+    fresh = oauth_auth.OAuthState(config)
+    fresh.restore_tokens(root)
+    for _, _, value, _ in old + stale:
+        assert token_store.lookup_token(root, "access", value) is None
+        assert fresh.validate_access_token(value) is False
+    for _, _, value, _ in current:
+        assert token_store.lookup_token(root, "access", value) is not None
+        assert fresh.validate_access_token(value) is True
     assert token_store.lookup_token(root, "access", seed) is None
 
 

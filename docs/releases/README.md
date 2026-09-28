@@ -2,7 +2,7 @@
 
 Files in this directory preserve the release brief, integrated plan, risk reviews, counsel packet, and related pre-release evidence.
 
-## Current v0.7 Flight Deck artifacts
+## Historical v0.7 Flight Deck artifacts
 
 - `v0.7-flight-deck-research-package.md` — grounded research package + release brief (G1).
 - `v0.7-flight-deck-risk-register.md` — architecture risk register (G2; input to legal review).
@@ -15,10 +15,12 @@ Files in this directory preserve the release brief, integrated plan, risk review
 - `v0.7-flight-deck-trt-handoff.md` — TRT technical editorial source pack with verified claims and guardrails (t_8e69d56b).
 - `v0.7-flight-deck-tony-handoff.md` — Tony approval-gate summary (t_8e69d56b).
 
-These are **current release-program artifacts** for the v0.7.0 Flight Deck
-release. Status statements such as "DRAFT", "pending approval", or "candidate"
-record the state at the time the artifact was written; they are not runtime
-instructions.
+These are **historical release-program artifacts** for the v0.7.0 Flight Deck
+release. They preserve the program's research, risk, implementation, and approval
+records. Status statements such as "DRAFT", "pending approval", or "candidate"
+record the state at the time the artifact was written; they are not current
+release status or runtime instructions. The release records themselves are
+preserved unchanged.
 
 ## Historical v0.6 artifacts
 

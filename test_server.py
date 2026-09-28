@@ -81,6 +81,21 @@ def test_build_server_extends_transport_allowlist_from_env(monkeypatch):
     assert "127.0.0.1" in allowed
 
 
+def test_asgi_app_does_not_register_browser_ui_routes(monkeypatch):
+    clear_gate_envs(monkeypatch)
+    monkeypatch.setenv("HERMES_GPT_UI_ENABLED", "1")
+
+    app = server.build_asgi_app(server.build_server(http=True), http=True)
+    # CORSMiddleware -> bearer middleware -> Starlette route table.
+    routes = app.app.app.routes
+    paths = {getattr(route, "path", "") for route in routes}
+
+    assert not any(path == "/ui" or path.startswith("/api/") for path in paths)
+    assert "/events/ws" in paths
+    assert "/" in paths
+    assert isinstance(routes[-1], server.Mount)
+
+
 def test_default_tool_surface_is_read_or_local_metadata_only(monkeypatch):
     clear_gate_envs(monkeypatch)
 
@@ -105,6 +120,7 @@ def test_default_tool_surface_is_read_or_local_metadata_only(monkeypatch):
         "hermes_session_search",
         "hermes_session_continue",
         "hermes_session_send",
+        "hermes_session_create",
         "hermes_bot_chat_send",
         "hermes_session_job_status",
         "hermes_session_job_result",
@@ -161,6 +177,7 @@ def test_env_gates_expose_high_risk_tools(monkeypatch):
     assert "hermes_session_search" in names
     assert "hermes_session_continue" in names
     assert "hermes_session_send" in names
+    assert "hermes_session_create" in names
     assert "hermes_bot_chat_send" in names
     assert "hermes_session_job_status" in names
     assert "hermes_session_job_result" in names

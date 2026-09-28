@@ -3186,24 +3186,8 @@ def build_asgi_app(server: FastMCP, *, http: bool) -> Any:
                 Route("/oauth/token", token, methods=["POST"]),
             ]
         )
-    # Mount browser UI routes before the MCP catch-all. The UI remains opt-in
-    # and a missing optional UI module must not change the MCP-only server.
-    ui_enabled = False
-    try:
-        import ui_security as _ui_security
-
-        ui_enabled = _ui_security.ui_enabled()
-    except Exception:  # noqa: BLE001
-        ui_enabled = os.environ.get("HERMES_GPT_UI_ENABLED") == "1"
-    if ui_enabled:
-        try:
-            import ui_api
-
-            routes.extend(ui_api.routes())
-        except Exception as exc:  # noqa: BLE001
-            eprint(f"UI mount skipped: {exc.__class__.__name__}: {exc}")
     # v0.9 live-event delivery is read-only and remains behind the same outer
-    # Bearer/OAuth middleware as MCP and the browser UI.
+    # Bearer/OAuth middleware as MCP.
     routes.extend(
         op_live_events.websocket_routes(
             _default_hermes_root,

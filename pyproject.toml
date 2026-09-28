@@ -89,12 +89,6 @@ py-modules = [
   "updater",
   "versioning",
   "hermes_state",
-  "ui_api",
-  "ui_security",
-  "ui_chat",
-  "ui_ops",
-  "ui_fabric",
-  "ui_missions",
 ]
 
 [tool.setuptools.data-files]
@@ -130,8 +124,6 @@ py-modules = [
   "docs/release-notes-v0.8.0.md",
   "docs/retention-policy.md",
   "docs/windows-chatgpt-codex.md",
-  "docs/ui-security-boundary.md",
-  "docs/flight-deck-coverage.md",
   "docs/flight-deck-missions.md",
   "docs/gemini-spark.md",
 ]

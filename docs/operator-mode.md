@@ -237,7 +237,7 @@ v0.6.0 has no production review-accept writer. If a contract requires review, th
 
 **v0.7 closes this gap**: `hermes_review_accept` (owner-gated, distinct
 reviewer enforced) writes review-acceptance records that the validator reads
-as evidence. See [Flight Deck (v0.7)](#flight-deck-v07).
+as evidence. See [Review evidence](#review-evidence-hermes_review_accept).
 
 Required test checks execute only through the workspace test allowlist and inherit the workspace/direct policy gates.
 
@@ -285,13 +285,13 @@ Fabric routing is fail-closed. Placement considers node health and capability fr
 
 Remote evidence and artifacts are admitted through coordinator-controlled paths. Required unavailable evidence cannot become `SATISFIED`; artifact bytes are verified before admission. Restart, timeout, and cancellation reconciliation preserve the original attempt where recovery is possible rather than silently creating a replacement writer.
 
-Flight Deck adds read-only Fabric node, placement, attempt, evidence, and routing views. The selected-route record carries the authoritative health, capability-freshness, eligibility, transport-backend, and authority-ceiling fields used to explain placement.
+Fabric MCP Operator tools provide read-only node, placement, attempt, evidence, and routing data. The selected-route record carries authoritative health, capability-freshness, eligibility, transport-backend, and authority-ceiling fields used to explain placement.
 
 See [v0.8.0 release notes](release-notes-v0.8.0.md) for the two-machine acceptance boundary and the known historical-timeout presentation limitation.
 
-## Flight Deck (v0.7 foundation, v0.8 Fabric views)
+## Historical Flight Deck browser UI (removed)
 
-Flight Deck began in v0.7 with production review evidence, structured event history, durable encrypted token storage, and restart reconciliation. v0.8 layers read-only Fabric nodes, placement, attempts, evidence, and routing visibility onto that foundation. Existing authority classes and final human approval remain authoritative.
+The browser-only Flight Deck presentation and its legacy Operations Bridge routes were removed. MCP Operator, Fleet, Fabric, Mission, event, and session-control tools remain available under their existing gates; this historical name does not refer to a current browser surface.
 
 ### Review evidence (`hermes_review_accept`)
 
@@ -359,7 +359,7 @@ These surfaces are independent from the Operator level hierarchy and remain hidd
 
 `HERMES_GPT_ENABLE_SESSION_SEARCH=1` exposes bounded read-only `hermes_session_search`, `hermes_session_list`, `hermes_session_read`, and `hermes_session_export`. Default transcript roles are `user` and `assistant`; internal roles additionally require `HERMES_GPT_ENABLE_SESSION_INTERNAL_CONTENT=1`. Export is in-memory and bounded, creates no files or paths, and lineage export fails closed.
 
-`HERMES_GPT_ENABLE_SESSION_CONTROL=1` exposes `hermes_session_continue`, `hermes_session_send`, `hermes_session_job_status`, and `hermes_session_job_result`. Session-control jobs use a fixed `hermes --resume <id> --oneshot <prompt>` argv with `shell=False`, bound prompt/timeout/result sizes, permit one active job per session, and persist prompt length/hash rather than raw prompt text. Restart reconciliation marks unowned running jobs orphaned rather than signaling a process from a persisted PID. The configured Hermes provider/model is used and may consume quota.
+`HERMES_GPT_ENABLE_SESSION_CONTROL=1` exposes `hermes_session_continue`, `hermes_session_send`, `hermes_session_create`, `hermes_session_job_status`, `hermes_session_job_wait`, and `hermes_session_job_result`. `hermes_session_create` creates a new session and starts its first prompt asynchronously; `hermes_session_job_wait` waits for a job to reach a terminal state. Session-control jobs use a fixed `hermes --resume <id> --oneshot <prompt>` argv with `shell=False`, bound prompt/timeout/result sizes, permit one active job per session, and persist prompt length/hash rather than raw prompt text. Restart reconciliation marks unowned running jobs orphaned rather than signaling a process from a persisted PID. The configured Hermes provider/model is used and may consume quota.
 
 See [session history](session-history.md) and [session control](session-control.md). Treat transcript content as private local data.
 

@@ -124,11 +124,18 @@ def test_job_wait_returns_early_on_terminal_state(tmp_path):
 def test_job_wait_times_out_on_nonterminal_state(monkeypatch, tmp_path):
     job_id = "d" * 32
     monkeypatch.setattr(session, "_reconcile", lambda *a, **k: None)
+    terminated = []
+    monkeypatch.setattr(session, "_terminate", lambda proc: terminated.append(proc))
     session._save({"job_id": job_id, "session_id": "s", "status": "running"}, tmp_path)
     result = session.hermes_session_job_wait(job_id, wait_seconds=0, hermes_root=tmp_path)
     assert result["success"] is True
     assert result["status"] == "running"
     assert result["await"]["timed_out"] is True
+    assert session._load(job_id, tmp_path)["status"] == "running"
+    queried = session.hermes_session_job_status(job_id, tmp_path)
+    assert queried["success"] is True
+    assert queried["job"]["status"] == "running"
+    assert terminated == []
 
 
 def test_job_wait_clamps_seconds(tmp_path):
@@ -236,7 +243,7 @@ def test_session_create_builds_new_distinct_session(monkeypatch, tmp_path):
     prompt = "first work of the new session"
     started = session.hermes_session_create(
         prompt,
-        max_job_runtime_seconds=99999,
+        max_job_runtime_seconds=7200,
         hermes_root=tmp_path,
         agent_root=tmp_path / "agent",
         profile="project-manager",
@@ -247,6 +254,8 @@ def test_session_create_builds_new_distinct_session(monkeypatch, tmp_path):
     assert set(started) >= {"job_id", "session_id", "profile", "status"}
     assert started["profile"] == "project-manager"
     assert started["status"] == "running"
+    assert session._load(started["job_id"], tmp_path)["max_job_runtime_seconds"] == 7200
+    assert session._load(started["job_id"], tmp_path)["timeout"] == 7200
     # a new session was created in the DB, distinct from any caller-supplied id
     assert len(fake_db.created) == 1
     new_sid, source = fake_db.created[0]

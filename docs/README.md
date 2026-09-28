@@ -32,11 +32,11 @@ PyPI is an independent distribution channel. Check the PyPI badge in the root RE
 | [`file-export.md`](file-export.md) | current | bounded binary file transfer, workspace/denied-path gates, size/extension limits, MCP embedded-resource semantics |
 | [`openai-secure-mcp-tunnel.md`](openai-secure-mcp-tunnel.md) | current | outbound-only private access from supported OpenAI products to loopback Hermes GPT |
 | [`cloudflare-tunnel.md`](cloudflare-tunnel.md) | current | public Cloudflare HTTPS proxy deployment and Host allowlist behavior |
-| [`operator-mode.md`](operator-mode.md) | current | Operator / Owner policy, Mission Control, fleet routing, Work Contracts, Swarm Orchestration, v0.8 Fabric execution, and Flight Deck surfaces |
+| [`operator-mode.md`](operator-mode.md) | current | Operator / Owner policy, Mission Control, fleet routing, Work Contracts, Swarm Orchestration, and v0.8 Fabric execution |
 | [`finance.md`](finance.md) | current | bounded ChatGPT-to-Hermes Finance bridge, finance evidence/decision contracts, persistence boundary, activation, and verification |
 | [`missions.md`](missions.md) | current | v0.9 first-class Mission lifecycle, bounded context/skills manifests, attachments, reconciliation, and Owner approval |
 | [`live-events.md`](live-events.md) | current | v0.9 durable event cursor/long-poll and authenticated WebSocket wake-up stream |
-| [`flight-deck-missions.md`](flight-deck-missions.md) | current | v0.9 read-only Mission/delegation Flight Deck views with durable live refresh |
+| [`flight-deck-missions.md`](flight-deck-missions.md) | historical | former browser Mission/delegation Flight Deck views; browser UI removed |
 | [`delegations.md`](delegations.md) | current | v0.9 normalized delegation lifecycle across Pi/OpenCode/Codex/Fabric with durable lineage and reconciliation |
 | [`codex.md`](codex.md) | current | Codex-as-MCP-client setup and delegated Codex CLI jobs |
 | [`windows-chatgpt-codex.md`](windows-chatgpt-codex.md) | current | Windows ChatGPT -> Hermes GPT -> Codex CLI deployment |
@@ -44,8 +44,6 @@ PyPI is an independent distribution channel. Check the PyPI badge in the root RE
 | [`retention-policy.md`](retention-policy.md) | current | local diagnostic artifact retention and cleanup |
 | [`session-history.md`](session-history.md) | current | gated read-only session history surface and privacy defaults |
 | [`session-control.md`](session-control.md) | current | gated asynchronous session continue/send jobs |
-| [`ui-security-boundary.md`](ui-security-boundary.md) | current | conversational UI browser security boundary and opt-in UI mount |
-| [`flight-deck-coverage.md`](flight-deck-coverage.md) | current | Flight Deck browser coverage and mutation safety decisions |
 | [`release-notes-v0.8.0.md`](release-notes-v0.8.0.md) | current release record | shipped v0.8 Fabric behavior, G6 acceptance boundary, and known limitation |
 | [`release-notes-v0.7.0.md`](release-notes-v0.7.0.md) | historical release record | shipped v0.7 behavior and gates |
 | [`release-notes-v0.6.0.md`](release-notes-v0.6.0.md) | current release record | shipped v0.6 behavior and known limitations |
@@ -107,8 +105,8 @@ These are version records, not current setup instructions:
 
 The following directories contain valuable provenance, but they are not operational source-of-truth documents:
 
-- `design/` - technical design documents written before or during implementation. v0.6 designs are historical; v0.7 Flight Deck architecture and ADRs are current design artifacts for the v0.7 release cycle.
-- `releases/` - release brief, integrated plan, risk reviews, counsel packet, and surface manifest created during pre-release work. v0.6 artifacts are historical; v0.7 Flight Deck research package, risk register, and implementation plan are current release-program artifacts.
+- `design/` - technical design documents written before or during implementation. v0.6 and v0.7 Flight Deck designs and ADRs are historical artifacts, not current runtime instructions.
+- `releases/` - release brief, integrated plan, risk reviews, counsel packet, and surface manifest created during pre-release work. v0.6 and v0.7 Flight Deck research, risk, implementation, and approval documents are historical release-program artifacts, not current release status or runtime instructions.
 
 Some of these files intentionally preserve phrases such as "candidate", "gate", or "before release" because they record the state at the time they were written. Agents must not treat those historical status statements as the current release state.
 

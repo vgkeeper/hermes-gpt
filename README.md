@@ -77,7 +77,7 @@ v0.8.0 "Fabric" turns the v0.7 control plane into a local-first distributed exec
 2. **Capability-aware `auto` routing** - placement uses current node health/freshness, backend capability, profile/workspace policy, and authority ceilings, with explicit overrides preserved.
 3. **Remote evidence and artifacts** - remote evidence is admitted into the existing Work Contract boundary; missing required evidence fails closed and artifact bytes are hash-verified.
 4. **Restart/timeout/cancel reconciliation** - recoverable ambiguity reconciles the original attempt, with single-writer/write-epoch protections for mutation-capable paths.
-5. **Fabric Flight Deck visibility** - read-only node, placement, attempt, evidence, and routing views expose the authoritative selected-route fields.
+5. **Fabric observability** - read-only MCP Operator/Fabric tools expose node, placement, attempt, evidence, and routing state, including authoritative selected-route fields.
 
 The final Fabric implementation passed fresh real two-machine G6 acceptance and independent review; the authoritative acceptance record is on [issue #37](https://github.com/asimons81/hermes-gpt/issues/37). G7 Owner ship authorization is recorded on [issue #27](https://github.com/asimons81/hermes-gpt/issues/27). See the [v0.8.0 release notes](docs/release-notes-v0.8.0.md) for the acceptance boundary, known presentation limitation, and additional changes included since v0.7.0.
 
@@ -176,7 +176,7 @@ Session history and session control are independent, opt-in surfaces.
 
 With `HERMES_GPT_ENABLE_SESSION_SEARCH=1`, Hermes GPT exposes four bounded read-only history tools: `hermes_session_search`, `hermes_session_list`, `hermes_session_read`, and `hermes_session_export`. The default transcript roles are `user` and `assistant`; `system`, `tool`, and `function` content additionally requires `HERMES_GPT_ENABLE_SESSION_INTERNAL_CONTENT=1`. Export stays in memory, is size/message bounded, creates no files or paths, and lineage export fails closed.
 
-With `HERMES_GPT_ENABLE_SESSION_CONTROL=1`, Hermes GPT exposes `hermes_session_continue`, `hermes_session_send`, `hermes_session_job_status`, and `hermes_session_job_result`. Control jobs are bounded, use fixed argv with `shell=False`, allow only one active job per session, persist prompt length/hash rather than raw prompts, and return bounded redacted results. A server restart fails closed by marking unowned running jobs orphaned rather than signaling a persisted PID.
+With `HERMES_GPT_ENABLE_SESSION_CONTROL=1`, Hermes GPT exposes `hermes_session_continue`, `hermes_session_send`, `hermes_session_create`, `hermes_session_job_status`, `hermes_session_job_wait`, and `hermes_session_job_result`. `hermes_session_create` creates a new session and starts its first prompt asynchronously; `hermes_session_job_wait` waits for a job to reach a terminal state. Control jobs are bounded, use fixed argv with `shell=False`, allow only one active job per session, persist prompt length/hash rather than raw prompts, and return bounded redacted results. A server restart fails closed by marking unowned running jobs orphaned rather than signaling a persisted PID.
 
 See [session history](docs/session-history.md) and [session control](docs/session-control.md). Treat transcript data as private local data.
 
