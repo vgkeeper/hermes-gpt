@@ -33,6 +33,7 @@ import operator_diagnostics as op_diagnostics
 import operator_codex as op_codex
 import operator_fleet as op_fleet
 import operator_session as op_session
+import operator_work_bridge as op_work_bridge
 import operator_mission as op_mission
 import operator_mission_runtime as op_mission_runtime
 import operator_mission_plan as op_mission_plan
@@ -3292,6 +3293,7 @@ def register_tools(server: FastMCP) -> None:
         server.add_tool(hermes_session_job_result, meta=tool_meta())
         server.add_tool(hermes_session_job_result_page, meta=tool_meta())
         server.add_tool(hermes_session_job_wait, meta=tool_meta())
+    op_work_bridge.register_tools(server, meta=tool_meta())
     if env_enabled(ENABLE_VISION_ENV):
         server.add_tool(hermes_vision_analyze, meta=tool_meta())
     if env_enabled(ENABLE_WEB_ENV):

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added four narrow authenticated Hermes Work Bridge adapter tools (register/update/get/cancel) to the Hermes Pilote MCP. The bridge remains a separate service/repository; this module only calls its fixed API and never implements monitoring or Slack delivery. Setup and Work/Sheet protocol: `docs/work-bridge.md`.
+
 - Removed the browser-only Hermes WebUI and its legacy Operations Bridge API, including browser chat, ops, Fabric, Mission, and security routes. The MCP server, ChatGPT OAuth/client integration, MCP Operator/Fleet tools, and session-control tools remain available.
 
 ## 0.12.0 - 2026-09-22

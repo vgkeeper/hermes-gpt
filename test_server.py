@@ -153,6 +153,10 @@ def test_default_tool_surface_is_read_or_local_metadata_only(monkeypatch):
         "hermes_cron_create",
         "hermes_skill_create",
         "hermes_owner_run_command",
+        "hermes_work_mission_register",
+        "hermes_work_mission_update_job",
+        "hermes_work_mission_get",
+        "hermes_work_mission_cancel",
     ]:
         assert operator_tool in names
 
@@ -1623,8 +1627,9 @@ V09_CONNECTOR_ADDITIONS = [
 # + 3 capability-manifest / mission-ledger tools (sibling derivation-views card)
 # + 4 mission-budget envelope tools (sibling t_78e597c6) + 4 placement-scoring
 # tools (sibling t_167ac591) + 4 failure-semantics tools (t_49bbc143) + 4
-# supervised-mission-controller tools (t_ad1e6d07).
-V09_CONNECTOR_TOOL_COUNT = 137
+# + 4 supervised-mission-controller tools (t_ad1e6d07) + 4 Hermes Work
+# bridge-adapter tools (register/update/get/cancel).
+V09_CONNECTOR_TOOL_COUNT = 141
 
 
 def test_v09_connector_surface_acceptance(monkeypatch):
@@ -1665,7 +1670,7 @@ def test_history_enabled_connector_surface_acceptance(monkeypatch):
         "hermes_bot_chat_get",
     }
 
-    assert len(enabled_names) == len(set(enabled_names)) == 142
+    assert len(enabled_names) == len(set(enabled_names)) == 146
     assert set(enabled_names) - set(disabled_names) == expected_history_tools
     assert set(disabled_names) - set(enabled_names) == set()
 
