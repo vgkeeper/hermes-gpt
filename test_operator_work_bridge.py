@@ -56,6 +56,7 @@ def test_update_get_cancel_routes_and_validation(monkeypatch):
 def test_bridge_is_fail_closed_when_unconfigured(monkeypatch):
     monkeypatch.delenv(bridge.URL_ENV, raising=False)
     monkeypatch.delenv(bridge.TOKEN_ENV, raising=False)
+    monkeypatch.delenv(bridge.TOKEN_FILE_ENV, raising=False)
     assert json.loads(bridge.hermes_work_mission_get("demo_m001"))["code"] == "BRIDGE_NOT_CONFIGURED"
 
 
@@ -64,3 +65,38 @@ def test_rejects_non_tls_external_url(monkeypatch):
     monkeypatch.setenv(bridge.TOKEN_ENV, "test-token")
     result = json.loads(bridge.hermes_work_mission_get("demo_m001"))
     assert result == {"success": False, "code": "BRIDGE_UNAVAILABLE", "detail": "ValueError"}
+
+
+def test_token_file_fallback_is_scoped_and_not_returned(monkeypatch, tmp_path):
+    configure(monkeypatch)
+    monkeypatch.delenv(bridge.TOKEN_ENV)
+    token_file = tmp_path / "bridge-token"
+    token_file.write_text("file-only-test-token" + chr(10), encoding="utf-8")
+    monkeypatch.setenv(bridge.TOKEN_FILE_ENV, str(token_file))
+    seen = {}
+
+    def fake_urlopen(req, timeout):
+        seen["authorization"] = req.get_header("Authorization")
+        return io.BytesIO(b'{"ok":true}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    result = json.loads(bridge.hermes_work_mission_get("demo_m001"))
+    assert result["success"] is True
+    assert seen["authorization"] == "Bearer file-only-test-token"
+    assert "file-only-test-token" not in json.dumps(result)
+
+
+def test_token_environment_takes_precedence_over_file(monkeypatch, tmp_path):
+    configure(monkeypatch)
+    token_file = tmp_path / "bridge-token"
+    token_file.write_text("file-token", encoding="utf-8")
+    monkeypatch.setenv(bridge.TOKEN_FILE_ENV, str(token_file))
+    seen = {}
+
+    def fake_urlopen(req, timeout):
+        seen["authorization"] = req.get_header("Authorization")
+        return io.BytesIO(b'{"ok":true}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert json.loads(bridge.hermes_work_mission_get("demo_m001"))["success"]
+    assert seen["authorization"] == "Bearer test-token"
