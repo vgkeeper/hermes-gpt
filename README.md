@@ -33,6 +33,10 @@ v0.12.0 is the vNext slice-2 release: the two designed-but-deferred mutation pat
 
 See [CHANGELOG.md](CHANGELOG.md) for the complete v0.12.0 change list.
 
+### Unreleased on `main`: Hermes Work Bridge adapter
+
+The current source branch adds four authenticated Pilote adapter tools; they are not part of the v0.12.0 release or PyPI package. See [docs/work-bridge.md](docs/work-bridge.md). The bridge service remains in its own repository. The connector acceptance count on this branch is 141 (historical v0.12.0 release: 137).
+
 ## What v0.11.0 adds
 
 v0.11.0 is a compatibility-and-reach release on top of the vNext slice-1 foundation: a verified Google Gemini Spark custom-app client profile, MCP Python SDK 2.x support, profile-aware Bot Chat and session delivery, and the post-v0.10 security remediation — with no change to the read-only / dry-run / shadow authority ladder and no new mutating surface enabled by default.

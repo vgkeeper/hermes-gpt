@@ -44,6 +44,7 @@ PyPI is an independent distribution channel. Check the PyPI badge in the root RE
 | [`retention-policy.md`](retention-policy.md) | current | local diagnostic artifact retention and cleanup |
 | [`session-history.md`](session-history.md) | current | gated read-only session history surface and privacy defaults |
 | [`session-control.md`](session-control.md) | current | gated asynchronous session continue/send jobs |
+| [`work-bridge.md`](work-bridge.md) | current | authenticated Pilote adapter to the independent Hermes Work Bridge |
 | [`release-notes-v0.8.0.md`](release-notes-v0.8.0.md) | current release record | shipped v0.8 Fabric behavior, G6 acceptance boundary, and known limitation |
 | [`release-notes-v0.7.0.md`](release-notes-v0.7.0.md) | historical release record | shipped v0.7 behavior and gates |
 | [`release-notes-v0.6.0.md`](release-notes-v0.6.0.md) | current release record | shipped v0.6 behavior and known limitations |

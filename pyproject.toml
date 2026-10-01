@@ -57,6 +57,7 @@ py-modules = [
   "operator_diagnostics",
   "operator_codex",
   "operator_session",
+  "operator_work_bridge",
   "operator_mission",
   "operator_mission_runtime",
   "operator_mission_plan",
