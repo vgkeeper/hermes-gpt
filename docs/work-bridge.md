@@ -9,7 +9,7 @@ Hermes GPT owns only this small MCP client. The service implementation, DB, job 
 - `hermes_work_mission_get(mission_id)`
 - `hermes_work_mission_cancel(mission_id)`
 
-These operations call the fixed `HERMES_WORK_BRIDGE_URL` with bearer token `HERMES_WORK_BRIDGE_TOKEN`; Work does not need arbitrary HTTP access or the token. The adapter rejects malformed IDs, caps response size/time, avoids printing token or response internals on errors, requires TLS except for explicitly private service DNS, and fails closed when unconfigured.
+These operations call the fixed `HERMES_WORK_BRIDGE_URL` with a bearer token from `HERMES_WORK_BRIDGE_TOKEN` or a narrowly mounted `HERMES_WORK_BRIDGE_TOKEN_FILE`; Work does not need arbitrary HTTP access or the token. The adapter rejects malformed IDs, caps response size/time, avoids printing token or response internals on errors, requires TLS except for explicitly private service DNS, and fails closed when unconfigured.
 
 ## Work/Sheet lifecycle
 
@@ -26,4 +26,4 @@ The Slack trigger is only a wake-up. Do not send secrets or PII. Slack may repea
 
 ## Runtime
 
-This module registers four additive Pilote tools. Configure its URL/token in the actual Hermes GPT runtime through the deployment's secret/configuration source. Do not commit either value. Full independent service API, Slack setup, and Coolify volumes/healthcheck are maintained in the bridge repository README.
+This module registers four additive Pilote tools. Configure `HERMES_WORK_BRIDGE_URL` in the runtime, and pass the API credential only to that service through `HERMES_WORK_BRIDGE_TOKEN_FILE`; avoid a bridge token environment variable shared by Hermes Agent/WebUI. The token file is outside source control and mode-restricted. Full independent service API, Slack setup, and Coolify volumes/healthcheck are maintained in the bridge repository README.

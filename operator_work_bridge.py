@@ -7,12 +7,27 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 URL_ENV = "HERMES_WORK_BRIDGE_URL"
 TOKEN_ENV = "HERMES_WORK_BRIDGE_TOKEN"
+TOKEN_FILE_ENV = "HERMES_WORK_BRIDGE_TOKEN_FILE"
 TIMEOUT_SECONDS = 8
 MAX_RESPONSE_BYTES = 64 * 1024
+
+
+def _token() -> str:
+    token = os.getenv(TOKEN_ENV, "").strip()
+    if token:
+        return token
+    path = os.getenv(TOKEN_FILE_ENV, "").strip()
+    if not path:
+        return ""
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 def _base_url() -> str:
@@ -31,7 +46,7 @@ def _base_url() -> str:
 
 
 def _call(method: str, path: str, payload: dict[str, Any] | None = None) -> str:
-    token = os.getenv(TOKEN_ENV, "")
+    token = _token()
     if not token:
         return json.dumps({"success": False, "code": "BRIDGE_NOT_CONFIGURED"})
     try:
