@@ -98,8 +98,17 @@ def test_events_rpc_and_modern_only_passthrough():
     asyncio.run(run())
 
 
-def test_real_http_modern_events_and_legacy_tools_compat(monkeypatch, tmp_path):
+def test_real_http_modern_events(monkeypatch, tmp_path):
+    from mcp_compat import SDK_V2
+
+    if not SDK_V2:
+        pytest.skip(
+            "MCP SDK 1.x rejects protocol 2026-07-28 before Events middleware; "
+            "the modern Events protocol requires SDK 2.x"
+        )
+
     import server
+
     monkeypatch.setenv("HERMES_GPT_ENABLE_MCP", "1")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     built = server.build_server(http=True)
@@ -114,9 +123,35 @@ def test_real_http_modern_events_and_legacy_tools_compat(monkeypatch, tmp_path):
         tools = client.post("/mcp", headers={**modern,"MCP-Method":"tools/list"}, json={"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}})
         assert tools.status_code == 200
         assert tools.json()["result"]["tools"]
-        legacy = client.post("/mcp", headers={"Accept":"application/json, text/event-stream"}, json={"jsonrpc":"2.0","id":4,"method":"events/list","params":{}})
-        assert legacy.status_code == 200
-        assert "result" not in legacy.json()
+
+
+def test_real_http_legacy_tools_compat(monkeypatch, tmp_path):
+    import server
+
+    monkeypatch.setenv("HERMES_GPT_ENABLE_MCP", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    built = server.build_server(http=True)
+    app = server.build_asgi_app(built, http=True)
+    with TestClient(app, base_url="http://127.0.0.1:7677") as client:
+        accept = "application/json, text/event-stream"
+        initialized = client.post("/mcp", headers={"Accept": accept}, json={
+            "jsonrpc":"2.0", "id":1, "method":"initialize",
+            "params":{"protocolVersion":"2025-11-25", "capabilities":{},
+                      "clientInfo":{"name":"pytest", "version":"1"}},
+        })
+        assert initialized.status_code == 200, initialized.text
+        assert initialized.json()["result"]["protocolVersion"] == "2025-11-25"
+        legacy = {"Accept": accept, "MCP-Protocol-Version":"2025-11-25"}
+        tools = client.post("/mcp", headers=legacy, json={
+            "jsonrpc":"2.0", "id":2, "method":"tools/list", "params":{},
+        })
+        assert tools.status_code == 200, tools.text
+        assert tools.json()["result"]["tools"]
+        events = client.post("/mcp", headers=legacy, json={
+            "jsonrpc":"2.0", "id":3, "method":"events/list", "params":{},
+        })
+        assert events.status_code == 200
+        assert "result" not in events.json()
 
 
 def test_middleware_streams_oversized_request_to_core_without_event_dispatch(monkeypatch):

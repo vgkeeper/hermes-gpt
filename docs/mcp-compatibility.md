@@ -36,6 +36,13 @@ stdio, SSE and existing `tools/*` remain on their existing paths. The modern
 custom discovery response advertises tools plus events; it does not provide
 resources/prompts discovery.
 
+The real-HTTP modern Events integration test runs on SDK 2.x. SDK 1.x rejects
+`MCP-Protocol-Version: 2026-07-28` in its transport before the Events middleware
+can intercept the request (its supported revisions stop at `2025-11-25`), so
+that one modern-protocol test explicitly skips on SDK 1.x. This does not claim
+SDK 1.x supports the modern protocol; the legacy initialize and `tools/list`
+compatibility test continues to run on both SDK families.
+
 The middleware buffers at most 256 KiB while identifying a request method.
 Larger requests are replayed to the core MCP transport unchanged; oversized
 draft Events requests are therefore unsupported, while ordinary large tool
