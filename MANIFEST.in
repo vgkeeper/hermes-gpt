@@ -22,6 +22,7 @@ include docs/retention-policy.md
 include docs/updating.md
 include docs/windows-chatgpt-codex.md
 include docs/gemini-spark.md
+include docs/autopilot.md
 recursive-include examples *.ps1
 prune docs/design
 prune docs/releases

@@ -1,6 +1,6 @@
 # Operator Mode for Hermes GPT
 
-Operator Mode is the policy-gated control plane for trusted MCP clients such as ChatGPT. This document describes the current v0.12.0 behavior, including the durable Mission lifecycle, unified delegation lineage, live-event bus, and Fabric-backed cross-machine Swarm execution, plus the vNext slice-1 additive surfaces (MissionPlan DAG, derived capability-manifest / mission-ledger views, budget envelope, placement scoring, failure classification + recovery matrix, and the shadow/observe mission controller) and the vNext slice-2 gated execution rungs (budget D3 hard-block enforcement behind `HERMES_GPT_BUDGET_HARD_BLOCK=1`, and the controller L2 rung behind `HERMES_GPT_CONTROLLER_EXECUTE=1`). The slice-1 surfaces are decision-only; the slice-2 rungs are default-off, add no tools, and keep every existing surface byte-identical until their gates are armed. They are documented further in [vnext-capability-manifest-and-mission-ledger.md](vnext-capability-manifest-and-mission-ledger.md) and [design/](design/).
+Operator Mode is the policy-gated control plane for trusted MCP clients such as ChatGPT. This document describes the current v0.13.0 behavior, including the durable Mission lifecycle, unified delegation lineage, live-event bus, and Fabric-backed cross-machine Swarm execution, plus the vNext slice-1 additive surfaces (MissionPlan DAG, derived capability-manifest / mission-ledger views, budget envelope, placement scoring, failure classification + recovery matrix, and the shadow/observe mission controller) and the vNext slice-2 gated execution rungs (budget D3 hard-block enforcement behind `HERMES_GPT_BUDGET_HARD_BLOCK=1`, and the controller L2 rung behind `HERMES_GPT_CONTROLLER_EXECUTE=1`). The slice-1 surfaces are decision-only; the slice-2 rungs are default-off, add no tools, and keep every existing surface byte-identical until their gates are armed. They are documented further in [vnext-capability-manifest-and-mission-ledger.md](vnext-capability-manifest-and-mission-ledger.md) and [design/](design/).
 
 For documentation authority and historical-artifact rules, see [docs/README.md](README.md).
 
@@ -232,6 +232,12 @@ Work Contracts add a structured, verifiable work-order layer through `hermes_con
 | `hermes_contract_validate(contract_json)` | read-only by default | Validate completion from observed evidence. |
 | `hermes_contract_status(contract_json)` | read-only | Link the contract to bounded observed run/delegation state. |
 
+For contracts that carry `capability_req`, dispatch revalidates the requested
+skills against the assigned profile's effective Hermes Agent loader immediately
+before invoking the runner. This is a live guard against profile changes after
+planning; rejection is non-mutating. Fabric eligibility remains separate from
+logical profile skill ownership.
+
 ### Validation model
 
 A worker's claim that work is complete is never proof by itself. Validation inspects observed state such as runs, artifacts, tests, audit evidence, and required review evidence.
@@ -286,6 +292,15 @@ Default caps, unless explicitly overridden by the supported environment variable
 - 3 concurrent stages per workflow;
 - 4 concurrent stages per board;
 - 12 stages per workflow.
+
+A Swarm stage may carry an optional `capability_req` with the logical profile and
+required skills. The generated Work Contract preserves that requirement, and
+dispatch revalidates it against the live Hermes Agent loader before invoking a
+runner. The probe uses `skill_view(..., preprocess=False)`, matching Hermes
+preload, so validating a required skill does not execute `skills.inline_shell`
+snippets. Removing a required skill after workflow creation therefore rejects the
+dispatch without starting work; Fabric remains a separate physical placement
+question.
 
 Failed validation can return a stage for one bounded rework retry. A second failure blocks the stage for human attention.
 
@@ -671,7 +686,7 @@ as much as Hermes GPT itself.
 Deployments can constrain autonomous routing with comma-separated allowlists:
 
 - `HERMES_GPT_RUNNER_BACKEND_ALLOWLIST` for backend names such as `fleet`,
-  `pi_rpc`, `omx`, and `codex`.
+  `pi_rpc`, `omx`, `codex`, and the explicitly selected `openhands` backend.
 - `HERMES_GPT_RUNNER_PROVIDER_ALLOWLIST` for provider names selected by Pi.
 - `HERMES_GPT_RUNNER_MODEL_ALLOWLIST` for model names selected by Pi, OMX, or
   Codex.
@@ -690,3 +705,7 @@ Local runner timeout and explicit-cancellation cleanup share one platform-aware
 path. POSIX signals the runner process group. Windows uses `taskkill /T /F` for
 the process tree and falls back to direct process termination if `taskkill` is
 unavailable, times out, or reports failure.
+
+## Autopilot (v0.13)
+
+Autopilot is an optional, default-off runtime that drives one Mission through its MissionPlan. It is enabled by the machine gate `HERMES_GPT_AUTOPILOT=1`, which registers `hermes_autopilot_start`, `hermes_autopilot_status`, and `hermes_autopilot_stop`; with the gate unset none of them exist. Starting needs `workspace` level, direct apply mode, `dry_run=false`, and `confirm=true` (a dry run previews and writes nothing); stopping never needs the machine gate. It adds no authority: every dispatch goes through the existing placement, Work Contract, and delegation surfaces, it never dispatches or advances an approval or `high_impact` node, and it cannot approve a Mission. See [autopilot.md](autopilot.md).
