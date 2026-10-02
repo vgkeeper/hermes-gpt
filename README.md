@@ -33,9 +33,9 @@ v0.12.0 is the vNext slice-2 release: the two designed-but-deferred mutation pat
 
 See [CHANGELOG.md](CHANGELOG.md) for the complete v0.12.0 change list.
 
-### Unreleased on `main`: Hermes Work Bridge adapter
+### Unreleased source features: Hermes Work Bridge and MCP Events
 
-The current source branch adds four authenticated Pilote adapter tools; they are not part of the v0.12.0 release or PyPI package. See [docs/work-bridge.md](docs/work-bridge.md). The bridge service remains in its own repository. The connector acceptance count on this branch is 141 (historical v0.12.0 release: 137).
+The current source branch adds four authenticated Pilote adapter tools; they are not part of the v0.12.0 release or PyPI package. The bridge service remains in its own repository; see [docs/work-bridge.md](docs/work-bridge.md). This branch also prototypes the draft OpenAI MCP Events extension for protocol `2026-07-28`, advertising only the test event `hermes.test`. It is not a production event-delivery bus; see [MCP compatibility](docs/mcp-compatibility.md#openai-mcp-events-extension). The connector acceptance count on this branch is 141 (historical v0.12.0 release: 137); the Events extension does not add tools.
 
 ## What v0.11.0 adds
 
@@ -114,6 +114,7 @@ See the [v0.6.0 release notes](docs/release-notes-v0.6.0.md) and [retention poli
 | Understand the repository and current docs | [Documentation map](docs/README.md) |
 | Run Hermes GPT locally | [Local quickstart](#local-quickstart) |
 | Connect ChatGPT/OpenAI privately without publishing Hermes GPT | [OpenAI Secure MCP Tunnel](docs/openai-secure-mcp-tunnel.md) |
+| Deploy the dedicated Hermes MCP Gateway | [Gateway architecture and rollback](docs/hermes-mcp-gateway.md) |
 | Authenticate a remote MCP connector | [OAuth and bearer authentication](docs/oauth.md) |
 | Connect Google Gemini (consumer Custom apps) | [Gemini Spark custom app](docs/gemini-spark.md) |
 | Verify the MCP protocol surface | [MCP compatibility manifest](docs/mcp-compatibility.md) |

@@ -13,6 +13,17 @@ python server.py
 
 Read-only history remains separately controlled by `HERMES_GPT_ENABLE_SESSION_SEARCH=1`. Enable both when the client needs to list or inspect sessions before choosing one to continue. See [session history](session-history.md) for its four-tool read-only workflow and privacy defaults.
 
+For a dedicated gateway that shares the same `HERMES_HOME/session-jobs` directory
+with another Hermes process but has its own PID namespace, also set
+`HERMES_GPT_SESSION_CONTROL_SHARED_STATE=1`. In this mode the gateway does not
+infer that a foreign `running` job is dead from an invisible/container-local
+PID. Status/result reads preserve that record and annotate it with
+`process_visibility: external_pid_namespace`; continuation of the same
+profile/session is refused while a recent foreign job remains active. An
+unowned foreign job is marked `timed_out` only after its recorded maximum
+runtime expires. This is shared-filesystem coordination, not a remote process
+health check; run one authoritative job owner per session.
+
 ## Workflow
 
 1. Find a session ID with `hermes_session_list` when history is enabled.
@@ -60,7 +71,8 @@ session-store write returns `SESSION_CREATE_FAILED` without launching anything.
 - Job metadata: stored under the Hermes data root in `session-jobs/`.
 - Prompt privacy: raw prompts are not stored in metadata; only length and SHA-256 digest are retained.
 - Output: captured locally for later result retrieval and redacted before MCP exposure.
-- Restart behavior: a persisted running job not owned by the current server process is marked `orphaned`; persisted PIDs are never trusted or signaled.
+- Restart behavior without shared mode: a persisted running job not owned by the current server process is marked `orphaned`.
+- Shared-state mode with separate PID namespaces: `HERMES_GPT_SESSION_CONTROL_SHARED_STATE=1` keeps recent foreign running records readable and blocks same-session parallel starts; after the recorded max runtime they become `timed_out`. Persisted PIDs are never trusted or signaled in either mode.
 
 Session control can consume the configured provider's quota or incur provider charges. Do not enable it on an unauthenticated public endpoint, and review returned content before sharing it.
 

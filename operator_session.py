@@ -20,6 +20,7 @@ import operator_policy as op
 
 
 ENABLE_SESSION_CONTROL_ENV = "HERMES_GPT_ENABLE_SESSION_CONTROL"
+SESSION_CONTROL_SHARED_STATE_ENV = "HERMES_GPT_SESSION_CONTROL_SHARED_STATE"
 MAX_PROMPT_CHARS = 65_536
 MAX_RESULT_CHARS = 24_000
 MIN_JOB_RUNTIME_SECONDS = 10
@@ -161,6 +162,65 @@ def _load(job_id: str, hermes_root: Path | None = None) -> dict[str, Any] | None
         return None
 
 
+def _shared_state_enabled() -> bool:
+    """Whether this runtime shares job files with a process in another PID namespace."""
+    return op.env_truthy(SESSION_CONTROL_SHARED_STATE_ENV)
+
+
+def _job_runtime_limit(meta: dict[str, Any]) -> int:
+    raw = meta.get("max_job_runtime_seconds", meta.get("timeout", MAX_JOB_RUNTIME_SECONDS))
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return MAX_JOB_RUNTIME_SECONDS
+    return max(MIN_JOB_RUNTIME_SECONDS, min(raw, MAX_JOB_RUNTIME_SECONDS))
+
+
+def _job_age_seconds(meta: dict[str, Any]) -> float:
+    raw = meta.get("started_at") or meta.get("created_at")
+    if not isinstance(raw, str) or not raw:
+        return 0.0
+    try:
+        started = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return max(0.0, datetime.now(timezone.utc).timestamp() - started.timestamp())
+
+
+def _foreign_active_job(session_id: str, profile: str, hermes_root: Path | None = None) -> str | None:
+    """Find a recent job in the shared store that this PID namespace cannot own."""
+    if not _shared_state_enabled():
+        return None
+    root = _root(hermes_root)
+    if not root.exists():
+        return None
+    with _lock:
+        owned = set(_processes)
+    for path in root.glob("*.json"):
+        meta = _load(path.stem, hermes_root)
+        if not meta or path.stem in owned:
+            continue
+        if meta.get("status") not in {"starting", "running"}:
+            continue
+        if meta.get("session_id") != session_id or (meta.get("profile", "default") or "default") != profile:
+            continue
+        if _job_age_seconds(meta) < _job_runtime_limit(meta):
+            return path.stem
+    return None
+
+
+def _job_view(meta: dict[str, Any]) -> dict[str, Any]:
+    """Annotate foreign running jobs without persisting PID-namespace guesses."""
+    view = dict(meta)
+    if not _shared_state_enabled() or view.get("status") not in {"starting", "running"}:
+        return view
+    with _lock:
+        owned = str(view.get("job_id", "")) in _processes
+    if not owned:
+        view["process_visibility"] = "external_pid_namespace"
+    return view
+
+
 def _hermes_executable(agent_root: Path | None = None) -> str:
     if agent_root:
         candidate = Path(agent_root) / "venv" / ("Scripts" if os.name == "nt" else "bin") / (
@@ -230,6 +290,17 @@ def _start_job(
     :func:`hermes_session_create` (newly created session). The caller has
     already validated inputs and, for create, persisted the session.
     """
+    if _shared_state_enabled():
+        # A sibling server has a different PID namespace. Keep its recent jobs
+        # visible and refuse a parallel turn instead of falsely orphaning it.
+        _reconcile(hermes_root)
+        foreign_job = _foreign_active_job(safe_id, safe_profile, hermes_root)
+        if foreign_job:
+            return _error(
+                "SESSION_BUSY",
+                "This Hermes session already has a running session-control job in shared state.",
+                f"Wait for job {foreign_job} to reach a terminal state before sending another turn.",
+            )
     argv = [_hermes_executable(agent_root), "--resume", safe_id, "--oneshot", safe_prompt]
     active_key = f"{safe_profile}:{safe_id}"
     job_id = uuid4().hex
@@ -462,19 +533,33 @@ def _reconcile(hermes_root: Path | None = None) -> None:
         return
     with _lock:
         owned = set(_processes)
+    shared_state = _shared_state_enabled()
     for path in root.glob("*.json"):
         try:
             meta = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        job_id = str(meta.get("job_id", ""))
-        if meta.get("status") == "running" and job_id not in owned:
+        job_id = str(meta.get("job_id", path.stem))
+        active_state = meta.get("status") in ({"starting", "running"} if shared_state else {"running"})
+        if not active_state or job_id in owned:
+            continue
+        if shared_state and _job_age_seconds(meta) < _job_runtime_limit(meta):
+            # PID values are namespace-local. A sibling container may still own
+            # this live job, so preserve it until its recorded timeout elapses.
+            continue
+        if shared_state:
+            meta.update({
+                "status": "timed_out",
+                "ended_at": _now(),
+                "reconciliation": "shared-state job owner is outside this PID namespace; maximum runtime elapsed",
+            })
+        else:
             meta.update({
                 "status": "orphaned",
                 "ended_at": _now(),
                 "reconciliation": "server restarted; process ownership could not be proven",
             })
-            _save(meta, hermes_root)
+        _save(meta, hermes_root)
 
 
 def hermes_session_job_status(job_id: str, hermes_root: Path | None = None) -> dict[str, Any]:
@@ -482,7 +567,7 @@ def hermes_session_job_status(job_id: str, hermes_root: Path | None = None) -> d
     meta = _load(job_id, hermes_root)
     if not meta:
         return _error("JOB_NOT_FOUND", "Hermes session job was not found.", "Check the job ID returned by hermes_session_continue.")
-    return _redact({"success": True, "job": meta})
+    return _redact({"success": True, "job": _job_view(meta)})
 
 
 def _load_result_text(job_id: str, hermes_root: Path | None) -> str:
@@ -516,6 +601,9 @@ def hermes_session_job_result(job_id: str, max_chars: int = MAX_RESULT_CHARS, he
         "status": meta.get("status"),
         "return_code": meta.get("return_code"),
     }
+    visibility = _job_view(meta).get("process_visibility")
+    if visibility:
+        include["process_visibility"] = visibility
     char_limited = len(text) > cap
     preview, budget_limited = _bound_result_for_mcp(include, (text[:cap] if char_limited else text), budget - _MCP_OVERHEAD)
     preview_bytes = len(preview.encode("utf-8"))
@@ -566,6 +654,9 @@ def hermes_session_job_result_page(
         "status": meta.get("status"),
         "return_code": meta.get("return_code"),
     }
+    visibility = _job_view(meta).get("process_visibility")
+    if visibility:
+        include["process_visibility"] = visibility
     want = min(max_bytes, max(budget - _MCP_OVERHEAD - 4096, 64))
     chunk, start, end = _utf8_slice(text, offset, want)
     while _env_bytes_size({**include, "offset": start, "end_offset": end, "response": chunk}) > (budget - _MCP_OVERHEAD) and want > 64:

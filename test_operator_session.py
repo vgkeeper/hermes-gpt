@@ -1,5 +1,6 @@
 import json
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import operator_session as session
@@ -100,12 +101,99 @@ def test_same_session_cannot_run_concurrently(monkeypatch, tmp_path):
     assert result["code"] == "SESSION_BUSY"
 
 
-def test_reconcile_marks_unowned_running_job_orphaned(tmp_path):
+def test_reconcile_marks_unowned_running_job_orphaned(monkeypatch, tmp_path):
+    monkeypatch.delenv(session.SESSION_CONTROL_SHARED_STATE_ENV, raising=False)
     job_id = "a" * 32
     session._save({"job_id": job_id, "session_id": "s", "status": "running"}, tmp_path)
     result = session.hermes_session_job_status(job_id, tmp_path)
     assert result["job"]["status"] == "orphaned"
     assert "ownership" in result["job"]["reconciliation"]
+
+
+def test_shared_state_preserves_recent_foreign_job_for_read_only_status_and_result(monkeypatch, tmp_path):
+    monkeypatch.setenv(session.SESSION_CONTROL_SHARED_STATE_ENV, "1")
+    job_id = "b" * 32
+    session._save(
+        {
+            "job_id": job_id,
+            "session_id": "shared-session",
+            "profile": "default",
+            "status": "running",
+            "started_at": session._now(),
+            "timeout": session.MAX_JOB_RUNTIME_SECONDS,
+            "max_job_runtime_seconds": session.MAX_JOB_RUNTIME_SECONDS,
+            "pid": 987654,
+        },
+        tmp_path,
+    )
+
+    status = session.hermes_session_job_status(job_id, tmp_path)
+    result = session.hermes_session_job_result(job_id, hermes_root=tmp_path)
+
+    assert status["job"]["status"] == "running"
+    assert status["job"]["process_visibility"] == "external_pid_namespace"
+    assert result["status"] == "running"
+    assert result["process_visibility"] == "external_pid_namespace"
+    persisted = session._load(job_id, tmp_path)
+    assert persisted is not None
+    assert persisted["status"] == "running"
+    assert "reconciliation" not in persisted
+
+
+def test_shared_state_times_out_foreign_job_only_after_recorded_max_runtime(monkeypatch, tmp_path):
+    monkeypatch.setenv(session.SESSION_CONTROL_SHARED_STATE_ENV, "1")
+    job_id = "c" * 32
+    started = datetime.now(timezone.utc) - timedelta(seconds=61)
+    session._save(
+        {
+            "job_id": job_id,
+            "session_id": "stale-shared-session",
+            "profile": "default",
+            "status": "running",
+            "started_at": started.isoformat(),
+            "timeout": 60,
+            "max_job_runtime_seconds": 60,
+            "pid": 987655,
+        },
+        tmp_path,
+    )
+
+    status = session.hermes_session_job_status(job_id, tmp_path)
+
+    assert status["job"]["status"] == "timed_out"
+    assert "maximum runtime elapsed" in status["job"]["reconciliation"]
+
+
+def test_shared_state_rejects_parallel_continue_for_foreign_active_job(monkeypatch, tmp_path):
+    monkeypatch.setenv(session.ENABLE_SESSION_CONTROL_ENV, "1")
+    monkeypatch.setenv(session.SESSION_CONTROL_SHARED_STATE_ENV, "1")
+    monkeypatch.setenv("HERMES_GPT_OPERATOR_ALLOWED_PROFILES", "default")
+    job_id = "d" * 32
+    session._save(
+        {
+            "job_id": job_id,
+            "session_id": "busy-shared-session",
+            "profile": "default",
+            "status": "running",
+            "started_at": session._now(),
+            "timeout": session.MAX_JOB_RUNTIME_SECONDS,
+            "max_job_runtime_seconds": session.MAX_JOB_RUNTIME_SECONDS,
+            "pid": 987656,
+        },
+        tmp_path,
+    )
+    def unexpected_start(*_args, **_kwargs):
+        raise AssertionError("shared-state conflict must not start another Hermes process")
+
+    monkeypatch.setattr(session.subprocess, "Popen", unexpected_start)
+
+    result = session.hermes_session_continue("busy-shared-session", "short safe turn", hermes_root=tmp_path)
+
+    assert result["success"] is False
+    assert result["code"] == "SESSION_BUSY"
+    assert job_id in json.dumps(result)
+    persisted = session._load(job_id, tmp_path)
+    assert persisted is not None and persisted["status"] == "running"
 
 
 def test_job_wait_returns_early_on_terminal_state(tmp_path):

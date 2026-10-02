@@ -201,6 +201,22 @@ MCP tools: `hermes_live_events_cursor()` and `hermes_live_events_since(cursor, m
 
 Live events are notifications, not proof. Mission, Swarm, Work Contract, runner, and Fabric journals remain authoritative; a missing, delayed, duplicated, or reconnected event never advances work. See [Live events (v0.9)](live-events.md).
 
+## OpenAI MCP Events extension (draft, experimental)
+
+This protocol-level extension is separate from the durable v0.9
+`hermes_live_events_*` stream above. On SDK 2.x Streamable HTTP it advertises
+`server/discover` and `events/list` and implements the draft subscription
+lifecycle, but currently exposes only the test event `hermes.test`. Its local
+`emit_test` helper is intentionally not an MCP tool or HTTP route; no Mission,
+session, or job lifecycle events are emitted by this prototype.
+
+Event RPCs use the existing authenticated `/mcp` boundary and do not grant
+Operator or Owner authority. Callback signing secrets are stored in the
+`HERMES_HOME` event database; delivery uses bounded in-process retries without
+a durable outbox. Treat this as an experimental integration test, not as a
+production notification or delivery guarantee. See
+[MCP compatibility](mcp-compatibility.md#openai-mcp-events-extension).
+
 ## Binary file export
 
 `hermes_export_file(path)` is a read-only raw-byte transfer surface gated at Operator `workspace` level. It requires a non-empty `HERMES_GPT_OPERATOR_ALLOWED_PATHS`, resolves paths before authorization so symlink escapes are refused, preserves all denied secret/credential paths even in Owner Mode, enforces a 4 MiB default and 16 MiB hard maximum, and supports an optional `HERMES_GPT_EXPORT_ALLOWED_EXTENSIONS` suffix allowlist. Successful bytes are returned as `EmbeddedResource(BlobResourceContents)` with safe metadata; client download/attachment rendering is client-controlled. See [Binary file export](file-export.md).

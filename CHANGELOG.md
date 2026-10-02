@@ -4,6 +4,10 @@
 
 - Added four narrow authenticated Hermes Work Bridge adapter tools (register/update/get/cancel) to the Hermes Pilote MCP. The bridge remains a separate service/repository; this module only calls its fixed API and never implements monitoring or Slack delivery. The adapter can read its bearer credential from an explicitly mounted token file (`HERMES_WORK_BRIDGE_TOKEN_FILE`) so the secret is scoped to the Pilote runtime. Setup and Work/Sheet protocol: `docs/work-bridge.md`.
 
+- Prototyped the draft OpenAI MCP Events extension for modern SDK 2.x protocol `2026-07-28`: `server/discover`, `events/list`, `events/subscribe`, and `events/unsubscribe`, with only the test event `hermes.test`. The interceptor bounds request inspection to 256 KiB and replays larger requests unchanged to core MCP; existing Operator authentication and authority gates are unchanged. Callback delivery uses public-HTTPS validation, pinned global IPs, Standard Webhooks signatures, and bounded in-process retries, but has no durable outbox or stable account principal. This remains experimental and provides no production delivery guarantee.
+
+- Added opt-in `HERMES_GPT_SESSION_CONTROL_SHARED_STATE=1` for a dedicated session-control gateway with the same `HERMES_HOME` but a separate PID namespace. Recent foreign running jobs remain visible instead of being falsely marked orphaned; a parallel continuation of the same profile/session is refused, and stale foreign jobs time out at their recorded maximum runtime. The default single-process orphan reconciliation remains unchanged.
+
 - Removed the browser-only Hermes WebUI and its legacy Operations Bridge API, including browser chat, ops, Fabric, Mission, and security routes. The MCP server, ChatGPT OAuth/client integration, MCP Operator/Fleet tools, and session-control tools remain available.
 
 ## 0.12.0 - 2026-09-22
