@@ -13,6 +13,20 @@ python server.py
 
 Read-only history remains separately controlled by `HERMES_GPT_ENABLE_SESSION_SEARCH=1`. Enable both when the client needs to list or inspect sessions before choosing one to continue. See [session history](session-history.md) for its four-tool read-only workflow and privacy defaults.
 
+For a dedicated gateway that shares the same `HERMES_HOME/session-jobs` directory
+with another Hermes process but has its own PID namespace, also set
+`HERMES_GPT_SESSION_CONTROL_SHARED_STATE=1`. New session-control jobs are owned by
+an independent worker process which holds an advisory lock in the shared Hermes
+home and refreshes an owner-token lease/heartbeat there. A restarted MCP server
+can therefore observe the job without inspecting a foreign `/proc` PID. Status
+reads preserve a running owner lease and annotate it with
+`process_visibility: external_pid_namespace`; lease expiry is not enough to
+orphan while the shared lock is still held. An expired lease with no lock is
+reconciled as `orphaned`. Legacy jobs without a lease keep their prior
+shared-state timeout behavior. Every runtime that reads or reconciles these
+records must use lease-aware code (or the legacy shared-state flag); an older
+runtime with shared-state disabled can still write a false orphan marker.
+
 ## Workflow
 
 1. Find a session ID with `hermes_session_list` when history is enabled.
@@ -21,13 +35,13 @@ Read-only history remains separately controlled by `HERMES_GPT_ENABLE_SESSION_SE
 4. Poll `hermes_session_job_status(job_id)` until the status is `completed`, `failed`, `timed_out`, or `orphaned`.
 5. Call `hermes_session_job_result(job_id)` for the bounded, redacted final output.
 
-The start call resolves exact or unique-prefix IDs through Hermes' existing read-only `SessionDB` API before launching anything. It invokes the CLI with a fixed argument array equivalent to:
+The start call resolves exact or unique-prefix IDs through Hermes' existing read-only `SessionDB` API before launching anything. It starts `operator_session_worker.py` with a private configuration payload over stdin (the prompt is not stored in job metadata), then the worker invokes the CLI with a fixed argument array equivalent to:
 
 ```text
 hermes --resume <resolved-session-id> --oneshot <prompt>
 ```
 
-No shell is used. Hermes restores the resumed session's recorded working directory using its normal CLI behavior.
+No shell is used. Hermes restores the resumed session's recorded working directory using its normal CLI behavior. The worker, not the MCP server process, holds the shared session lock, renews the lease, enforces the runtime deadline, captures output, and publishes the terminal job record.
 
 ## Creating a new session
 
@@ -56,14 +70,16 @@ session-store write returns `SESSION_CREATE_FAILED` without launching anything.
 - Prompt: maximum 65,536 characters.
 - Max job runtime: `max_job_runtime_seconds` clamped to 10–7,200 seconds; default 7,200. Independent of `hermes_session_job_wait` (max 120 s per poll, never kills).
 - Returned result: clamped to 500–24,000 characters.
-- Concurrency: only one session-control job may run for a given session at a time.
-- Job metadata: stored under the Hermes data root in `session-jobs/`.
-- Prompt privacy: raw prompts are not stored in metadata; only length and SHA-256 digest are retained.
-- Output: captured locally for later result retrieval and redacted before MCP exposure.
-- Restart behavior: a persisted running job not owned by the current server process is marked `orphaned`; persisted PIDs are never trusted or signaled.
+- Concurrency: an advisory lock under `session-jobs/session-leases/` admits one worker per profile/session across independent runtimes.
+- Job metadata: stored under the Hermes data root in `session-jobs/`; owner token, instance/container identity, worker PID, heartbeat, and lease expiry are internal fields and are removed from MCP views.
+- Prompt privacy: raw prompts are not stored in metadata; only length and SHA-256 digest are retained. The worker command configuration is sent over stdin, not written to disk.
+- Output: the worker captures locally for later result retrieval and output is redacted before MCP exposure.
+- Parent-process restart: the independent worker keeps its lease and job state alive; another lease-aware runtime can follow the same record without `/proc` access.
+- Reconciliation: a matching fresh lease or held shared lock prevents orphaning, even if a legacy reader previously wrote `orphaned`; a missing lock is treated as grace until the lease expires, then the job becomes `orphaned`.
+- Compatibility: records created before leases remain readable. A runtime running pre-lease code with shared-state disabled can still falsely mark a new job orphaned; upgrade that reader or enable its shared-state mode before using it to observe active jobs. PIDs are never trusted or signaled across namespaces.
 
 Session control can consume the configured provider's quota or incur provider charges. Do not enable it on an unauthenticated public endpoint, and review returned content before sharing it.
 
 ## Validation without a real model call
 
-The automated tests replace process launch with a fake Hermes process. They verify the fixed CLI arguments, `shell=False`, prompt-free metadata, runtime-limit bounds, restart reconciliation, redaction, tool registration gates, and status/result flow. The test suite does not resume a real session or contact a model provider.
+The automated tests include fake-process contract checks and local worker-process integration tests. They cover shared lock ownership, an MCP parent handle disappearing while the worker continues, a reader process without the owner PID handle, lease grace/expiry, concurrent continues, redaction, tool registration gates, and coherent status/result reads from two runtime processes. They do not contact a live model provider; the live gateway smoke test is recorded separately in the deployment checkpoint.

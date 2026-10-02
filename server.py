@@ -3111,7 +3111,9 @@ def build_asgi_app(server: FastMCP, *, http: bool) -> Any:
     if oauth_state is not None and not http:
         raise ValueError("Built-in OAuth is supported only with streamable HTTP (--http).")
     raw_mcp_app = server.streamable_http_app() if http else server.sse_app()
-    mcp_app = oauth_auth.DefaultMcpAcceptMiddleware(raw_mcp_app)
+    from mcp_compat import SDK_V2
+    from operator_mcp_events import EventsASGIMiddleware
+    mcp_app = EventsASGIMiddleware(oauth_auth.DefaultMcpAcceptMiddleware(raw_mcp_app), enabled=SDK_V2)
     static_bearer = oauth_auth.static_bearer_from_env() or ""
 
     async def live_websocket_authorized(websocket: Any) -> bool:

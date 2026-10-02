@@ -4,6 +4,7 @@ include CHANGELOG.md
 # Public-safe docs only. Internal counsel/design/release-planning packets
 # (docs/design/*, docs/releases/*) are intentionally NOT distributed.
 include docs/README.md
+include docs/hermes-mcp-gateway.md
 include docs/codex.md
 include docs/operator-mode.md
 include docs/mcp-compatibility.md
