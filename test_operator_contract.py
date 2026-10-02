@@ -20,8 +20,8 @@ from pathlib import Path
 
 import pytest
 
-import operator_policy as op
 import operator_contract as contract_mod
+import operator_policy as op
 
 # ---------------------------------------------------------------------------
 # Fixture builders
@@ -285,7 +285,7 @@ def test_legacy_validation_manifest_without_execution_lineage_fails_closed(herme
 
 def _add_review_evidence(contract: dict, *, reviewer: str = "default") -> None:
     """Write an audit acceptance record for a contract by a distinct reviewer."""
-    canonical, _, sha = contract_mod._parse_contract(json.dumps(contract))
+    _canonical, _, sha = contract_mod._parse_contract(json.dumps(contract))
     op.audit_record(
         tool="hermes_contract_validate",
         level="read_only",

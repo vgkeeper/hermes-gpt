@@ -60,10 +60,12 @@ user's own text only; unambiguous secret shapes are still removed.
   `build_asgi_app` wiring — **loopback default (no auth)**; static bearer or
   confidential-client OAuth when configured; remote profile remains blocked
   by the existing server gates. The UI adds no auth path of its own.
-- UI routes mount BEFORE `Mount("/", mcp_app)` when
+- UI routes mount BEFORE `Mount("/", mcp_app)` only when
   `HERMES_GPT_UI_ENABLED=1`, so same-origin `/api/*` and `/ui` calls never
-  fall through to the MCP catch-all. With the env unset, the mount code is
-  not even imported — installed wheels without the UI modules are unaffected.
+  fall through to the MCP catch-all. With the env unset, the UI route registry
+  and browser API modules are not imported; the gate helper is the only UI
+  module consulted. The separate Hermes WebUI process is not configured or
+  started by this option.
 
 ## 4. Account status (`GET /api/me`)
 

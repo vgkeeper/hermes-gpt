@@ -40,10 +40,10 @@ from pathlib import Path
 
 import pytest
 
+import operator_contract as contract_mod
 import operator_policy as op
 import operator_swarm as swarm
 import operator_swarm_workflows as swarm_workflows
-import operator_contract as contract_mod
 
 # ---------------------------------------------------------------------------
 # Fixture builders
@@ -778,7 +778,7 @@ def test_bounded_rework_second_failure_blocks(hermes_root, monkeypatch):
     assert out["rework_count"] == 2
     st = _status("sw-rw-001", hermes_root, monkeypatch)
     assert st["status"] == "blocked"
-    research = [s for s in st["stages"] if s["id"] == "research"][0]
+    research = next(s for s in st["stages"] if s["id"] == "research")
     assert research["status"] == "blocked"
 
 
@@ -1126,7 +1126,7 @@ def test_dispatch_requires_confirm_and_direct(hermes_root, monkeypatch):
     out = _dispatch("sw-gate-004", "research", hermes_root, monkeypatch, dry_run=True)
     assert out["success"] is True
     st = _status("sw-gate-004", hermes_root, monkeypatch)
-    research = [s for s in st["stages"] if s["id"] == "research"][0]
+    research = next(s for s in st["stages"] if s["id"] == "research")
     assert research["status"] == "todo"
     assert research["task_id"] == ""
 
@@ -1261,7 +1261,7 @@ def test_status_reads_observed_kanban_state(hermes_root, monkeypatch):
         [{"task_id": "sw-obs-001-research", "assignee": "hermes-dev", "status": "running", "outcome": None}],
     )
     out = _status("sw-obs-001", hermes_root, monkeypatch)
-    research = [s for s in out["stages"] if s["id"] == "research"][0]
+    research = next(s for s in out["stages"] if s["id"] == "research")
     assert research["observed"][0]["status"] == "running"
 
 
@@ -1305,7 +1305,7 @@ def test_full_lifecycle_advance_handoffs(hermes_root, monkeypatch):
     st = _status("sw-life-001", hermes_root, monkeypatch)
     assert st["status"] == "done"
     assert all(s["status"] == "done" for s in st["stages"])
-    arch = [s for s in st["stages"] if s["id"] == "architecture"][0]
+    arch = next(s for s in st["stages"] if s["id"] == "architecture")
     assert arch["handoffs"][0]["from"] == ["research"]
 
 

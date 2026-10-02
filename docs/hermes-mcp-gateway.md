@@ -36,7 +36,7 @@ The initial local-validation mode may leave the tunnel client disabled while the
 
 ## MCP Events maturity
 
-The OpenAI MCP Events extension remains a draft prototype. It advertises only `hermes.test`; it does not emit Mission/session/job notifications and does not provide a durable outbox or production delivery guarantee. The event callback uses the existing MCP authentication boundary, HTTPS-only destinations, globally routable IP validation, and Standard Webhooks signing. Do not treat a tool listing or an event subscription as proof that work completed.
+The OpenAI MCP Events adapter projects the single `hermes.live_event` wake-up event from the durable Live Events journal. Live Events remains the only durable business event journal; the adapter stores subscription cursors and callback state only, and never republishes callbacks. Events are notifications, not completion proof. The callback uses the existing MCP authentication boundary, HTTPS-only destinations, globally routable IP validation, and Standard Webhooks signing. See [MCP compatibility](mcp-compatibility.md#openai-mcp-events-extension) for cursor, retry, retention, and SDK-version behavior.
 
 ## Deployment and rollback
 

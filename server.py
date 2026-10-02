@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import ipaddress
 import importlib.metadata
 import inspect
+import ipaddress
 import json
 import os
 import re
@@ -12,51 +12,51 @@ import sqlite3
 import sys
 import urllib.parse
 from pathlib import Path
-from typing import Annotated, Any, List
+from types import TracebackType
+from typing import Annotated, Any
 
 from pydantic import Field
-
 from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import BaseRoute, Mount, Route
+from typing_extensions import Self
 
 import oauth_auth
-import operator_policy as op_policy
-import operator_cron as op_cron
-import operator_skills as op_skills
-import operator_config as op_config
-import operator_workspace as op_workspace
-import operator_export as op_export
-import operator_diagnostics as op_diagnostics
-import operator_codex as op_codex
-import operator_fleet as op_fleet
-import operator_session as op_session
-import operator_work_bridge as op_work_bridge
-import operator_mission as op_mission
-import operator_mission_runtime as op_mission_runtime
-import operator_mission_plan as op_mission_plan
-import operator_contract as op_contract
-import operator_delegations as op_delegations
-import operator_job_supervisor as op_jobs
-import operator_runners as op_runners
-import operator_review as op_review
-import operator_events as op_events
-import operator_live_events as op_live_events
-import operator_capability_manifest as op_capability_manifest
-import operator_mission_ledger as op_mission_ledger
-import operator_mission_budget as op_mission_budget
-import operator_placement as op_placement
-import operator_failure_semantics as op_failure_semantics
-import operator_controller as op_controller
-import operator_oauth as op_oauth
-import operator_swarm as op_swarm
-import operator_recovery as op_recovery
 import operator_autopilot as op_autopilot
+import operator_capability_manifest as op_capability_manifest
+import operator_codex as op_codex
+import operator_config as op_config
+import operator_contract as op_contract
+import operator_controller as op_controller
+import operator_cron as op_cron
+import operator_delegations as op_delegations
+import operator_diagnostics as op_diagnostics
+import operator_events as op_events
+import operator_export as op_export
+import operator_failure_semantics as op_failure_semantics
 import operator_finance as op_finance
+import operator_fleet as op_fleet
+import operator_job_supervisor as op_jobs
+import operator_live_events as op_live_events
+import operator_mission as op_mission
+import operator_mission_budget as op_mission_budget
+import operator_mission_ledger as op_mission_ledger
+import operator_mission_plan as op_mission_plan
+import operator_mission_runtime as op_mission_runtime
+import operator_oauth as op_oauth
+import operator_placement as op_placement
+import operator_policy as op_policy
+import operator_recovery as op_recovery
+import operator_review as op_review
+import operator_runners as op_runners
+import operator_session as op_session
+import operator_skills as op_skills
+import operator_swarm as op_swarm
+import operator_work_bridge as op_work_bridge
+import operator_workspace as op_workspace
 from versioning import VERSION
-
 
 LOCAL_DEV_PROFILE = "local-dev"
 REMOTE_PROFILE = "remote"
@@ -85,6 +85,10 @@ MAX_RESPONSE_BYTES = 262_144
 MAX_MESSAGE_SCAN_ROWS = 1_000
 DEFAULT_SESSION_OFFSET = 0
 DEFAULT_SESSION_MAX_RUNTIME_SECONDS = 7_200
+_TOOL_ERRORS = (ImportError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error)
+_SESSION_ERRORS = (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error)
+
+
 
 _DEFAULT_MESSAGE_ROLES = {"user", "assistant"}
 _INTERNAL_MESSAGE_ROLES = {"system", "tool", "function"}
@@ -160,7 +164,7 @@ def candidate_roots() -> list[Path]:
         try:
             dist = importlib.metadata.distribution(package)
             base = Path(dist.locate_file("")).resolve()
-        except Exception:
+        except (importlib.metadata.PackageNotFoundError, OSError, RuntimeError):
             continue
         for parent in [base, *base.parents]:
             if parent.name == "hermes-agent":
@@ -172,7 +176,7 @@ def candidate_roots() -> list[Path]:
     for candidate in candidates:
         try:
             resolved = candidate.expanduser().resolve()
-        except Exception:
+        except (OSError, RuntimeError):
             continue
         key = str(resolved).lower()
         if key not in seen:
@@ -217,6 +221,11 @@ def import_hermes() -> None:
     global vision_tool, web_tool
     try:
         HERMES_ROOT = find_hermes_root()
+    except RuntimeError as exc:
+        IMPORT_ERROR = str(exc)
+        eprint(f"hermes-gpt: Hermes source unavailable: {exc}")
+        return
+    try:
         add_hermes_to_syspath(HERMES_ROOT)
         from tools import file_tools as ft
         from tools import memory_tool as mt
@@ -230,21 +239,21 @@ def import_hermes() -> None:
             from tools import vision_tools as vt
 
             vision_tool = vt
-        except Exception as exc:
+        except ImportError as exc:
             eprint(f"hermes-gpt: vision tool unavailable: {exc}")
 
         try:
             from tools import web_tools as wt
 
             web_tool = wt
-        except Exception as exc:
+        except ImportError as exc:
             eprint(f"hermes-gpt: web tool unavailable: {exc}")
 
         try:
             from tools import skill_manager_tool as smt
 
             skill_manager_tool = smt
-        except Exception as exc:
+        except ImportError as exc:
             eprint(f"hermes-gpt: skill manager unavailable: {exc}")
 
         try:
@@ -254,9 +263,9 @@ def import_hermes() -> None:
             SessionDB = SDB
             get_hermes_home = ghh
             op_session.SessionDB = SDB
-        except Exception as exc:
+        except ImportError as exc:
             eprint(f"hermes-gpt: session search unavailable: {exc}")
-    except Exception as exc:
+    except ImportError as exc:
         IMPORT_ERROR = str(exc)
         eprint(f"hermes-gpt: Hermes imports failed: {exc}")
 
@@ -291,7 +300,7 @@ def require_imports() -> None:
 
 def _validate_limit(value: int, name: str, maximum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{name} must be an integer.")
+        raise TypeError(f"{name} must be an integer.")
     if value < 0:
         raise ValueError(f"{name} must not be negative.")
     if value > maximum:
@@ -303,15 +312,19 @@ def _validate_offset(value: int) -> int:
     return _validate_limit(value, "offset", MAX_OFFSET)
 
 
+class BooleanValidationError(ValueError):
+    """A boolean-only argument received a non-boolean value."""
+
+
 def _validate_bool(value: bool, name: str) -> bool:
     if not isinstance(value, bool):
-        raise ValueError(f"{name} must be a boolean.")
+        raise BooleanValidationError(f"{name} must be a boolean.")
     return value
 
 
 def _validate_session_id(value: str) -> str:
     if not isinstance(value, str):
-        raise ValueError("session_id must be a string.")
+        raise TypeError("session_id must be a string.")
     normalized = value.strip()
     if not normalized:
         raise ValueError("session_id must not be empty.")
@@ -322,7 +335,7 @@ def _validate_session_id(value: str) -> str:
 
 def _validate_query(value: str) -> str:
     if not isinstance(value, str):
-        raise ValueError("query must be a string.")
+        raise TypeError("query must be a string.")
     normalized = value.strip()
     if not normalized:
         raise ValueError("query must not be empty.")
@@ -457,7 +470,7 @@ class ReadOnlySessionAdapter:
         self._db = None
         self._disposed = False
 
-    def open(self) -> "ReadOnlySessionAdapter":
+    def open(self) -> ReadOnlySessionAdapter:
         if self._disposed:
             raise RuntimeError("Read-only session adapter has already been disposed.")
         if self._db is not None:
@@ -469,14 +482,20 @@ class ReadOnlySessionAdapter:
                 db_path=_session_profile_db_path(self._profile),
                 read_only=True,
             )
-        except Exception as exc:
+        except (OSError, RuntimeError, sqlite3.Error) as exc:
             raise RuntimeError(f"Hermes session database is unavailable: {_redact_error(exc)}") from exc
         return self
 
-    def __enter__(self) -> "ReadOnlySessionAdapter":
-        return self.open()
+    def __enter__(self) -> Self:
+        self.open()
+        return self
 
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         self.dispose_safely()
 
     def _require_db(self) -> Any:
@@ -617,7 +636,7 @@ class ReadOnlySessionAdapter:
             raise _SessionSearchUnavailable(
                 "read-only FTS search_messages API is unavailable"
             )
-        if hasattr(db, "_fts_enabled") and not bool(getattr(db, "_fts_enabled")):
+        if hasattr(db, "_fts_enabled") and not bool(db._fts_enabled):
             raise _SessionSearchUnavailable(
                 "read-only FTS is disabled by the installed SessionDB runtime"
             )
@@ -653,7 +672,7 @@ class ReadOnlySessionAdapter:
             return
         try:
             connection.close()
-        except Exception as exc:
+        except (OSError, sqlite3.Error) as exc:
             eprint(f"hermes-gpt: read-only session disposal failed: {_redact_error(exc)}")
 
 
@@ -663,7 +682,7 @@ def skill_roots() -> list[Path]:
     if callable(get_hermes_home):
         try:
             hermes_home = Path(get_hermes_home())
-        except Exception:
+        except (OSError, RuntimeError, TypeError, ValueError):
             hermes_home = None
     if hermes_home is None:
         env_home = os.environ.get("HERMES_HOME")
@@ -681,7 +700,7 @@ def skill_roots() -> list[Path]:
     for root in roots:
         try:
             resolved = root.expanduser().resolve()
-        except Exception:
+        except (OSError, RuntimeError):
             continue
         key = str(resolved).lower()
         if resolved.exists() and key not in seen:
@@ -724,7 +743,7 @@ def discover_skills() -> list[dict[str, str]]:
         for skill_md in root.rglob("SKILL.md"):
             try:
                 skills.append(parse_skill_doc(skill_md))
-            except Exception as exc:
+            except OSError as exc:
                 eprint(f"hermes-gpt: could not read skill {skill_md}: {exc}")
     return sorted(skills, key=lambda item: (item["name"].lower(), item["path"].lower()))
 
@@ -734,9 +753,10 @@ def clean_error(tool_name: str, exc: Exception) -> RuntimeError:
     return RuntimeError(f"{tool_name} failed: {exc}")
 
 
-from mcp_compat import HermesMCP as FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult, ToolAnnotations
+
+from mcp_compat import HermesMCP as FastMCP
 
 import_hermes()
 
@@ -760,7 +780,7 @@ def hermes_read_file(path: str, offset: int = 1, limit: int = 500) -> str:
     try:
         require_imports()
         return file_tools.read_file_tool(path=expand_path(path), offset=offset, limit=limit)
-    except Exception as exc:
+    except _TOOL_ERRORS as exc:
         raise clean_error("hermes_read_file", exc) from exc
 
 
@@ -768,7 +788,7 @@ def hermes_write_file(path: str, content: str) -> str:
     try:
         require_imports()
         return file_tools.write_file_tool(path=expand_path(path), content=content)
-    except Exception as exc:
+    except _TOOL_ERRORS as exc:
         raise clean_error("hermes_write_file", exc) from exc
 
 
@@ -789,7 +809,7 @@ def hermes_patch(
             new_string=new_string,
             replace_all=replace_all,
         )
-    except Exception as exc:
+    except _TOOL_ERRORS as exc:
         raise clean_error("hermes_patch", exc) from exc
 
 
@@ -810,7 +830,7 @@ def hermes_search_files(
             file_glob=file_glob,
             limit=limit,
         )
-    except Exception as exc:
+    except _TOOL_ERRORS as exc:
         raise clean_error("hermes_search_files", exc) from exc
 
 
@@ -826,7 +846,7 @@ def hermes_run_command(command: str, timeout: int = 30, workdir: str | None = No
             timeout=capped_timeout,
             workdir=expand_path(workdir),
         )
-    except Exception as exc:
+    except _TOOL_ERRORS as exc:
         raise clean_error("hermes_run_command", exc) from exc
 
 
@@ -843,7 +863,7 @@ def hermes_memory(
         if action in {"add", "replace", "remove"} and not env_enabled(ENABLE_MEMORY_WRITE_ENV):
             raise RuntimeError(f"Memory write actions are disabled. Set {ENABLE_MEMORY_WRITE_ENV}=1 to enable them.")
         return memory_tool.memory_tool(action=action, target=target, content=content, old_text=old_text)
-    except Exception as exc:
+    except _TOOL_ERRORS as exc:
         raise clean_error("hermes_memory", exc) from exc
 
 
@@ -865,7 +885,7 @@ def hermes_skill_list() -> str:
             desc = f" - {skill['description']}" if skill["description"] else ""
             lines.append(f"- {skill['name']}{desc}\n  {skill['path']}")
         return "\n".join(lines)
-    except Exception as exc:
+    except _TOOL_ERRORS as exc:
         raise clean_error("hermes_skill_list", exc) from exc
 
 
@@ -889,7 +909,7 @@ def hermes_skill_view(name: str) -> str:
             text = skill_path.read_text(encoding="utf-8", errors="replace")
             return text[:MAX_VIEW_BYTES] + f"\n\n--- TRUNCATED (showing {MAX_VIEW_BYTES} of {file_size} bytes). Use hermes_read_file for specific sections. ---"
         return skill_path.read_text(encoding="utf-8", errors="replace")
-    except Exception as exc:
+    except _TOOL_ERRORS as exc:
         raise clean_error("hermes_skill_view", exc) from exc
 
 
@@ -989,7 +1009,7 @@ def hermes_bot_chat_get(profile: str = "default") -> str:
             "current": current,
         }
         return json.dumps(_redact_value(payload), ensure_ascii=False, separators=(",", ":"))
-    except Exception as exc:
+    except _SESSION_ERRORS as exc:
         return _session_error("BOT_CHAT_LOOKUP_FAILED", _redact_error(exc))
     finally:
         adapter.dispose_safely()
@@ -1027,7 +1047,7 @@ def hermes_bot_chat_send(
             max_job_runtime_seconds=max_job_runtime_seconds,
             profile=safe_profile,
         )
-    except Exception as exc:
+    except _SESSION_ERRORS as exc:
         return op_policy.make_error_envelope(
             layer="session_control",
             code="BOT_CHAT_SEND_FAILED",
@@ -1074,7 +1094,7 @@ def hermes_session_list(
             requested_limit=safe_limit,
             extra={"profile": safe_profile},
         )
-    except Exception as exc:
+    except _SESSION_ERRORS as exc:
         return _session_error("SESSION_LIST_FAILED", _redact_error(exc))
     finally:
         adapter.dispose_safely()
@@ -1104,7 +1124,7 @@ def hermes_session_read(
         safe_include_inactive = _validate_bool(include_inactive, "include_inactive")
         safe_include_system = _validate_bool(include_system_messages, "include_system_messages")
         safe_include_tool = _validate_bool(include_tool_messages, "include_tool_messages")
-        allowed_roles = _allowed_message_roles(
+        _allowed_message_roles(
             include_system_messages=safe_include_system,
             include_tool_messages=safe_include_tool,
         )
@@ -1132,7 +1152,7 @@ def hermes_session_read(
             has_more_override=page["has_more"],
             next_offset_override=page["next_offset"],
         )
-    except Exception as exc:
+    except _SESSION_ERRORS as exc:
         return _session_error("SESSION_READ_FAILED", _redact_error(exc))
     finally:
         adapter.dispose_safely()
@@ -1254,7 +1274,7 @@ def hermes_session_export(
             has_more_override=page["has_more"],
             next_offset_override=page["next_offset"],
         )
-    except Exception as exc:
+    except _SESSION_ERRORS as exc:
         return _session_error("SESSION_EXPORT_FAILED", _redact_error(exc))
     finally:
         adapter.dispose_safely()
@@ -1286,7 +1306,7 @@ def hermes_session_search(
         message = f"Hermes session search is unavailable in this install: {exc}. Read-only FTS support is unavailable; no FTS activation or rebuild was attempted."
         eprint(f"hermes-gpt: {message}")
         return message
-    except Exception as exc:
+    except _SESSION_ERRORS as exc:
         message = (
             f"Hermes session search is unavailable in this install: {exc}. "
             "Read-only FTS search was unavailable; no FTS activation or rebuild was attempted."
@@ -1345,7 +1365,7 @@ def hermes_session_continue(
             agent_root=HERMES_ROOT,
             profile=safe_profile,
         )
-    except Exception as exc:
+    except _SESSION_ERRORS as exc:
         return op_policy.make_error_envelope(
             layer="session_control",
             code="SESSION_CONTINUE_FAILED",
@@ -1416,7 +1436,7 @@ def hermes_session_create(
             profile=safe_profile,
             title=title,
         )
-    except Exception as exc:
+    except _SESSION_ERRORS as exc:
         return op_policy.make_error_envelope(
             layer="session_control",
             code="SESSION_CREATE_FAILED",
@@ -1477,7 +1497,7 @@ def hermes_vision_analyze(image_url: str, question: str = "") -> str:
             )
         )
         return result
-    except Exception as exc:
+    except _TOOL_ERRORS as exc:
         raise clean_error("hermes_vision_analyze", exc) from exc
 
 
@@ -1494,12 +1514,12 @@ def hermes_web_search(query: str, limit: int = 5) -> str:
                 "Web tool is not available (import failed at startup)."
             )
         return web_tool.web_search_tool(query=query, limit=limit)
-    except Exception as exc:
+    except _TOOL_ERRORS as exc:
         raise clean_error("hermes_web_search", exc) from exc
 
 
 def hermes_web_extract(
-    urls: List[str],
+    urls: list[str],
     char_limit: int | None = None,
 ) -> str:
     """Extract content from web pages using Hermes Agent web_extract. Env-gated."""
@@ -1522,7 +1542,7 @@ def hermes_web_extract(
             web_tool.web_extract_tool(urls=urls, **kwargs)
         )
         return result
-    except Exception as exc:
+    except _TOOL_ERRORS as exc:
         raise clean_error("hermes_web_extract", exc) from exc
 
 
@@ -1595,7 +1615,7 @@ def _active_profile_name() -> str:
                 if idx + 1 < len(parts):
                     return parts[idx + 1]
         return "default"
-    except Exception:
+    except (OSError, RuntimeError, ValueError):
         return "default"
 
 
@@ -1609,7 +1629,7 @@ def hermes_operator_policy() -> str:
         summary = policy.to_summary()
         summary["success"] = True
         return json.dumps(summary, indent=2)
-    except Exception as exc:
+    except _TOOL_ERRORS as exc:
         return json.dumps(
             op_policy.error_from_exception(
                 exc,
@@ -1750,7 +1770,7 @@ def hermes_operator_status() -> str:
             "audit_log_path": str(op_policy.audit_log_path()),
         }
         return json.dumps(result, indent=2)
-    except Exception as exc:
+    except _TOOL_ERRORS as exc:
         return json.dumps(
             op_policy.error_from_exception(
                 exc,
@@ -1769,7 +1789,7 @@ def hermes_operator_audit_tail(limit: int = 20) -> str:
         return json.dumps(
             {"success": True, "count": len(records), "records": records}, indent=2
         )
-    except Exception as exc:
+    except _TOOL_ERRORS as exc:
         return json.dumps(
             op_policy.error_from_exception(
                 exc,
@@ -3013,7 +3033,7 @@ def oauth_state_from_env() -> oauth_auth.OAuthState | None:
     # a missing/corrupt envelope fails closed to empty stores.
     try:
         state.restore_tokens(_default_hermes_root())
-    except Exception:
+    except (OSError, RuntimeError, ValueError, sqlite3.Error):
         pass
     return state
 
@@ -3155,7 +3175,7 @@ def _register_fleet_local_card() -> None:
                 ],
             },
         )
-    except Exception:  # noqa: BLE001
+    except (OSError, RuntimeError, ValueError):
         pass
 
 
@@ -3165,8 +3185,14 @@ def build_asgi_app(server: FastMCP, *, http: bool) -> Any:
         raise ValueError("Built-in OAuth is supported only with streamable HTTP (--http).")
     raw_mcp_app = server.streamable_http_app() if http else server.sse_app()
     from mcp_compat import SDK_V2
-    from operator_mcp_events import EventsASGIMiddleware
-    mcp_app = EventsASGIMiddleware(oauth_auth.DefaultMcpAcceptMiddleware(raw_mcp_app), enabled=SDK_V2)
+    from operator_mcp_events import EventsASGIMiddleware, start_projector
+    mcp_app = EventsASGIMiddleware(
+        oauth_auth.DefaultMcpAcceptMiddleware(raw_mcp_app),
+        enabled=SDK_V2,
+        hermes_root_getter=_default_hermes_root,
+    )
+    if http and SDK_V2:
+        start_projector(_default_hermes_root())
     static_bearer = oauth_auth.static_bearer_from_env() or ""
 
     async def live_websocket_authorized(websocket: Any) -> bool:
@@ -3242,6 +3268,22 @@ def build_asgi_app(server: FastMCP, *, http: bool) -> Any:
                 Route("/oauth/token", token, methods=["POST"]),
             ]
         )
+    # Browser routes are opt-in and remain inside the existing Bearer/OAuth boundary.
+    ui_enabled = False
+    try:
+        import ui_security as _ui_security
+
+        ui_enabled = _ui_security.ui_enabled()
+    except ImportError:
+        ui_enabled = os.environ.get("HERMES_GPT_UI_ENABLED") == "1"
+    if ui_enabled:
+        try:
+            import ui_api
+
+            routes.extend(ui_api.routes())
+        except (ImportError, OSError, RuntimeError, ValueError) as exc:
+            eprint(f"UI mount skipped: {exc.__class__.__name__}: {exc}")
+
     # v0.9 live-event delivery is read-only and remains behind the same outer
     # Bearer/OAuth middleware as MCP.
     routes.extend(
@@ -3303,7 +3345,7 @@ def build_server(
             allowed_origins=list(dict.fromkeys(allowed_origins)),
         ),
     )
-    setattr(server, "_hermes_oauth_state", oauth_state)
+    server._hermes_oauth_state = oauth_state
     if oauth_state is not None:
         # v0.7 S5: persist every token issuance/refresh through token_store.
         # Persistence failures PROPAGATE: the strict exchange path turns them
@@ -3924,7 +3966,7 @@ def main(argv: list[str] | None = None) -> None:
                     "gateway": "running" if data.get("gateway_running") else "not_running",
                     "gateway_pid_source": data.get("gateway_pid_source"),
                 }
-            except Exception:
+            except (OSError, json.JSONDecodeError):
                 return {"ok": False, "gateway": "unknown"}
 
         codex_config.main(args[1:], list_tools=list_tools, status=status)

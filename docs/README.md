@@ -16,7 +16,7 @@ A design document describes intended architecture. It does not override implemen
 
 ## Current version context
 
-Repository version: **0.13.0**. The GitHub release target is `v0.13.0`; verify the public GitHub Releases and PyPI channels independently.
+Repository source baseline: **0.13.0** (upstream). This integration branch does not establish release or distribution availability; verify GitHub Releases and PyPI independently before making such claims.
 
 PyPI is an independent distribution channel. Check the PyPI badge in the root README before assuming `pip install hermes-gpt` contains a particular feature set; v0.13 Autopilot requires a published PyPI version of 0.13.0 or newer *and* `HERMES_GPT_AUTOPILOT=1`; v0.12 gated budget-enforcement and controller-L2 behavior requires a published PyPI version of 0.12.0 or newer *and* the corresponding machine gates armed; v0.11 Gemini Spark / Bot Chat / SDK 2 behavior requires a published PyPI version of 0.11.0 or newer; v0.10 vNext derived views / controller surfaces and v0.9 Mission/delegation/live-event behavior require 0.10.0 (or 0.9.0) or newer, respectively.
 
@@ -24,7 +24,7 @@ PyPI is an independent distribution channel. Check the PyPI badge in the root RE
 
 | Document | Authority | Use it for |
 | --- | --- | --- |
-| [`../README.md`](../README.md) | current | project overview, current release, quickstart, safety invariants, entry-point selection |
+| [`../README.md`](../README.md) | current | project overview, source baseline, quickstart, safety invariants, entry-point selection; distribution availability is separate |
 | [`runtime-checkout.md`](runtime-checkout.md) | host deployment provenance | which checkout the live `hermes-gpt-server.service` serves, and a caution that it is not the branch you happened to inspect |
 | [`oauth.md`](oauth.md) | current | static bearer and confidential-client OAuth configuration, token lifecycle, refresh rotation, and remote authentication limits |
 | [`gemini-spark.md`](gemini-spark.md) | current | opt-in Gemini Spark client profile: dedicated-instance or additional-client setup, exact callback discovery, verification, and rollback |
@@ -38,8 +38,10 @@ PyPI is an independent distribution channel. Check the PyPI badge in the root RE
 | [`missions.md`](missions.md) | current | v0.9 first-class Mission lifecycle, bounded context/skills manifests, attachments, reconciliation, and Owner approval |
 | [`autopilot.md`](autopilot.md) | current | v0.13 Autopilot: gates, tools, limits, the durable worker, approval frontier, recovery, budget interplay, status summary |
 | [`live-events.md`](live-events.md) | current | v0.9 durable event cursor/long-poll and authenticated WebSocket wake-up stream |
-| [`flight-deck-missions.md`](flight-deck-missions.md) | historical | former browser Mission/delegation Flight Deck views; browser UI removed |
-| [`delegations.md`](delegations.md) | current | v0.9 normalized delegation lifecycle across Pi/OpenCode/Codex/Fabric with durable lineage and reconciliation |
+| [`flight-deck-missions.md`](flight-deck-missions.md) | current, opt-in | read-only Mission and Autopilot Flight Deck views; enabled only with `HERMES_GPT_UI_ENABLED=1` |
+| [`ui-security-boundary.md`](ui-security-boundary.md) | current | browser authentication, redaction, authorization, and separate UI mount boundary |
+| [`flight-deck-coverage.md`](flight-deck-coverage.md) | implementation coverage | UI route and frontend test inventory; policy authority remains in Operator Mode |
+| [`delegations.md`](delegations.md) | current | v0.9 normalized delegation lifecycle across Pi/OpenCode/Codex/Fabric and explicitly selected OpenHands with durable lineage and reconciliation |
 | [`codex.md`](codex.md) | current | Codex-as-MCP-client setup and delegated Codex CLI jobs |
 | [`windows-chatgpt-codex.md`](windows-chatgpt-codex.md) | current | Windows ChatGPT -> Hermes GPT -> Codex CLI deployment |
 | [`updating.md`](updating.md) | current | check-first Git and PyPI update behavior |
@@ -47,6 +49,7 @@ PyPI is an independent distribution channel. Check the PyPI badge in the root RE
 | [`session-history.md`](session-history.md) | current | gated read-only session history surface and privacy defaults |
 | [`session-control.md`](session-control.md) | current | gated asynchronous session continue/send jobs |
 | [`work-bridge.md`](work-bridge.md) | current | authenticated Pilote adapter to the independent Hermes Work Bridge |
+| [`releases/v0.13.0-release-notes.md`](releases/v0.13.0-release-notes.md) | prepared upstream notes | v0.13 Autopilot source changes; explicitly not a tag or publication record |
 | [`release-notes-v0.8.0.md`](release-notes-v0.8.0.md) | current release record | shipped v0.8 Fabric behavior, G6 acceptance boundary, and known limitation |
 | [`release-notes-v0.7.0.md`](release-notes-v0.7.0.md) | historical release record | shipped v0.7 behavior and gates |
 | [`release-notes-v0.6.0.md`](release-notes-v0.6.0.md) | current release record | shipped v0.6 behavior and known limitations |

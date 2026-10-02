@@ -25,27 +25,30 @@ silently added here.
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
+from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any
 
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-import operator_policy as op
-import operator_mission as op_mission
-import operator_events as op_events
-import operator_swarm as op_swarm
 import operator_codex as op_codex
 import operator_cron as op_cron
-import operator_fleet as op_fleet
-import operator_review as op_review
 import operator_diagnostics as op_diagnostics
-import operator_recovery as op_recovery
+import operator_events as op_events
+import operator_mission as op_mission
 import operator_oauth as op_oauth
+import operator_policy as op
+import operator_recovery as op_recovery
+import operator_review as op_review
+import operator_swarm as op_swarm
 from versioning import VERSION
+
+_READ_ERRORS = (OSError, RuntimeError, sqlite3.Error, ValueError)
 
 # The 12 Mission Control surfaces (must match operator_mission.MISSION_SURFACES).
 MISSION_SURFACES: tuple[str, ...] = op_mission.MISSION_SURFACES
@@ -106,7 +109,7 @@ def _clamp_int(value: Any, default: int, lo: int, hi: int) -> int:
 
 def _resolve_root() -> Any:
     """Resolve the active Hermes data root (mirrors server.py defaults)."""
-    return op_mission._resolve_root(None)  # noqa: SLF001 - same-package reuse
+    return op_mission._resolve_root(None)
 
 
 def _parse_payload(result: Any) -> dict[str, Any]:
@@ -125,21 +128,18 @@ def _parse_payload(result: Any) -> dict[str, Any]:
 
 
 def _audit(tool: str, *, success: bool, summary: str, extra: dict[str, Any] | None = None) -> None:
-    """Best-effort adapter-level audit record (never breaks a request)."""
-    try:
-        policy = op.OperatorPolicy()
-        op.audit_record(
-            tool=tool,
-            level=policy.level or "read_only",
-            apply_mode=policy.apply_mode,
-            dry_run=True,
-            success=bool(success),
-            changed=False,
-            summary=str(summary)[:500],
-            extra=extra or {},
-        )
-    except Exception:  # noqa: BLE001 - audit must never break the surface
-        pass
+    """Append an adapter-level audit record."""
+    policy = op.OperatorPolicy()
+    op.audit_record(
+        tool=tool,
+        level=policy.level or "read_only",
+        apply_mode=policy.apply_mode,
+        dry_run=True,
+        success=bool(success),
+        changed=False,
+        summary=str(summary)[:500],
+        extra=extra or {},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -157,20 +157,20 @@ def _surface_payload(surface: str, force_refresh: bool) -> dict[str, Any]:
     """
     root = _resolve_root()
     tid = op.new_trace_id()
-    if not op_mission._surface_allowed(surface):  # noqa: SLF001
-        denied = op_mission._mission_denied(tool=f"hermes_mission_{surface}", surface=surface)  # noqa: SLF001
+    if not op_mission._surface_allowed(surface):
+        denied = op_mission._mission_denied(tool=f"hermes_mission_{surface}", surface=surface)
         _audit(f"hermes_mission_{surface}", success=False, summary=f"denied:{surface}", extra={"trace_id": tid})
         return denied
     try:
         if surface == "overview":
-            raw = op_mission.hermes_mission_overview(  # noqa: SLF001
+            raw = op_mission.hermes_mission_overview(
                 hermes_root=root, force_refresh=force_refresh, trace_id=tid
             )
             payload = _parse_payload(raw)
         else:
             payload = _SURFACE_DICT_FNS[surface](hermes_root=root, trace_id=tid)
-    except Exception as exc:  # noqa: BLE001 - surfaces degrade gracefully
-        payload = op_mission._mission_error(  # noqa: SLF001
+    except _READ_ERRORS as exc:
+        payload = op_mission._mission_error(
             tool=f"hermes_mission_{surface}",
             surface=surface,
             code="MISSION_SURFACE_ERROR",
@@ -231,7 +231,7 @@ def _events(request: Request) -> JSONResponse:
                 hermes_root=root,
             )
         payload = _parse_payload(raw)
-    except Exception as exc:  # noqa: BLE001
+    except _READ_ERRORS as exc:
         return _json_resp(_err("INTERNAL", f"events query failed: {op.redact_output(str(exc))[:300]}"), 500)
     _audit("hermes_events_query", success=True, summary=f"events mode={mode} limit={limit}")
     return _json_resp(_ok(payload), 200)
@@ -269,7 +269,7 @@ def _contracts_list(request: Request) -> JSONResponse:
             "workflows": workflows[:_CONTRACT_WORKFLOW_LIMIT],
             "generated_at": _now_iso(),
         }
-    except Exception as exc:  # noqa: BLE001
+    except _READ_ERRORS as exc:
         return _json_resp(_err("INTERNAL", f"contracts read failed: {op.redact_output(str(exc))[:300]}"), 500)
     _audit("hermes_contract_status", success=True, summary="contracts list read-model")
     return _json_resp(_ok(payload), 200)
@@ -290,7 +290,7 @@ def _contracts_detail(request: Request) -> JSONResponse:
                 matching_workflows.append(
                     {"workflow_id": wf.get("workflow_id"), "title": wf.get("title"), "status": wf.get("status")}
                 )
-    except Exception as exc:  # noqa: BLE001
+    except _READ_ERRORS as exc:
         return _json_resp(_err("INTERNAL", f"contract detail failed: {op.redact_output(str(exc))[:300]}"), 500)
     if not acceptances and not matching_workflows:
         return _json_resp(_err("NOT_FOUND", f"no evidence found for contract {sha[:16]}…"), 404)
@@ -311,7 +311,7 @@ def _review_detail(request: Request) -> JSONResponse:
     root = _resolve_root()
     try:
         acceptances = [r for r in _read_review_records(root, limit=500) if r.get("contract_sha256") == sha]
-    except Exception as exc:  # noqa: BLE001
+    except _READ_ERRORS as exc:
         return _json_resp(_err("INTERNAL", f"review read failed: {op.redact_output(str(exc))[:300]}"), 500)
     payload = {"success": True, "contract_sha256": sha, "count": len(acceptances), "records": acceptances}
     _audit("operator_review.read_review_acceptances", success=True, summary=f"review records {sha[:16]}")
@@ -323,7 +323,7 @@ def _swarm_list(request: Request) -> JSONResponse:
     root = _resolve_root()
     try:
         payload = _parse_payload(op_swarm.hermes_swarm_workflow_list(hermes_root=root))
-    except Exception as exc:  # noqa: BLE001
+    except _READ_ERRORS as exc:
         return _json_resp(_err("INTERNAL", f"swarm list failed: {op.redact_output(str(exc))[:300]}"), 500)
     _audit("hermes_swarm_workflow_list", success=True, summary="swarm list")
     return _json_resp(_ok(payload), 200)
@@ -335,7 +335,7 @@ def _swarm_detail(request: Request) -> JSONResponse:
     root = _resolve_root()
     try:
         payload = _parse_payload(op_swarm.hermes_swarm_workflow_status(workflow_id=workflow_id, hermes_root=root))
-    except Exception as exc:  # noqa: BLE001
+    except _READ_ERRORS as exc:
         return _json_resp(_err("INTERNAL", f"swarm status failed: {op.redact_output(str(exc))[:300]}"), 500)
     if not payload.get("success", True) and payload.get("code") == "WORKFLOW_NOT_FOUND":
         return _json_resp(_err("NOT_FOUND", payload.get("safe_message") or f"workflow {workflow_id!r} not found"), 404)
@@ -355,7 +355,7 @@ def _codex_detail(request: Request) -> JSONResponse:
             return _json_resp(_ok(status), 200)
         result = op_codex.hermes_codex_job_result(job_id=job_id, hermes_root=root)
         payload = {"success": True, "job": status.get("job"), "result": result}
-    except Exception as exc:  # noqa: BLE001
+    except _READ_ERRORS as exc:
         return _json_resp(_err("INTERNAL", f"codex job status failed: {op.redact_output(str(exc))[:300]}"), 500)
     _audit("hermes_codex_job_status", success=True, summary=f"codex job {job_id[:40]}")
     return _json_resp(_ok(payload), 200)
@@ -369,7 +369,7 @@ def _cron_detail(request: Request) -> JSONResponse:
         payload = _parse_payload(op_cron.hermes_cron_list(profile="default", include_disabled=True, hermes_root=root))
         jobs = payload.get("jobs", []) if payload.get("success", True) else []
         job = next((j for j in jobs if str(j.get("id") or "") == job_id), None)
-    except Exception as exc:  # noqa: BLE001
+    except _READ_ERRORS as exc:
         return _json_resp(_err("INTERNAL", f"cron detail failed: {op.redact_output(str(exc))[:300]}"), 500)
     if job is None:
         return _json_resp(_err("NOT_FOUND", f"cron job {job_id!r} not found"), 404)
@@ -394,7 +394,7 @@ def _account(request: Request) -> JSONResponse:
             "server_version": VERSION,
             "generated_at": _now_iso(),
         }
-    except Exception as exc:  # noqa: BLE001
+    except _READ_ERRORS as exc:
         return _json_resp(_err("INTERNAL", f"account status failed: {op.redact_output(str(exc))[:300]}"), 500)
     _audit("hermes_oauth_status", success=True, summary="account status")
     return _json_resp(_ok(payload), 200)
@@ -414,7 +414,7 @@ def _account(request: Request) -> JSONResponse:
 
 
 class _MutationSpec:
-    __slots__ = ("fn", "args", "required_level", "confirm_gated", "long_running", "apply_flag")
+    __slots__ = ("apply_flag", "args", "confirm_gated", "fn", "long_running", "required_level")
 
     def __init__(
         self,
@@ -575,7 +575,7 @@ async def _action(request: Request) -> JSONResponse:
     """POST /api/ops/action — execute an existing gated hermes_* tool path."""
     try:
         body = await request.json()
-    except Exception:  # noqa: BLE001
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return _json_resp(_err("INVALID_JSON", "request body must be a JSON object"), 400)
     if not isinstance(body, dict):
         return _json_resp(_err("INVALID_JSON", "request body must be a JSON object"), 400)
@@ -618,7 +618,7 @@ async def _action(request: Request) -> JSONResponse:
                 name=f"ui-ops-{tool}",
                 daemon=True,
             ).start()
-        except Exception as exc:  # noqa: BLE001
+        except _READ_ERRORS as exc:
             return _json_resp(_err("INTERNAL", f"failed to dispatch {tool}: {op.redact_output(str(exc))[:300]}"), 500)
         _audit(tool, success=True, summary=f"{tool} dispatched (long-running)")
         return _json_resp(_ok({"tool": tool, "accepted": True, "status": "running", "dry_run": False}), 202)
@@ -627,7 +627,7 @@ async def _action(request: Request) -> JSONResponse:
         root = _resolve_root()
         result = await run_in_threadpool(spec.fn, hermes_root=root, **kwargs)
         payload = _parse_payload(result)
-    except Exception as exc:  # noqa: BLE001
+    except _READ_ERRORS as exc:
         return _json_resp(_err("INTERNAL", f"{tool} failed: {op.redact_output(str(exc))[:300]}"), 500)
 
     _audit(tool, success=bool(payload.get("success", True)), summary=f"{tool} executed dry_run={dry_run_effective}")

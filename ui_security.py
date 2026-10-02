@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
@@ -405,7 +406,7 @@ def account_status(hermes_root: Path | None = None) -> str:
         import token_store
 
         status = token_store.status(root)
-    except Exception:  # noqa: BLE001 — degraded status must not crash /api/me
+    except (ImportError, OSError, RuntimeError, ValueError, sqlite3.Error):
         status = {"presence": "error"}
     presence = status.get("presence")
     if presence in ("absent", "error"):
@@ -423,11 +424,13 @@ def account_status(hermes_root: Path | None = None) -> str:
             return ACCOUNT_STATUS_EXPIRED
     elif isinstance(expires_at, str) and expires_at:
         try:
-            parsed = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-            if parsed.timestamp() < now:
-                return ACCOUNT_STATUS_EXPIRED
-        except ValueError:
-            pass
+            is_expired = datetime.fromisoformat(
+                expires_at.replace("Z", "+00:00")
+            ).timestamp() < now
+        except (OverflowError, OSError, ValueError):
+            is_expired = False
+        if is_expired:
+            return ACCOUNT_STATUS_EXPIRED
     return ACCOUNT_STATUS_OK
 
 
@@ -435,7 +438,7 @@ def operator_level() -> str:
     """Return the effective operator level (policy snapshot)."""
     try:
         return op.OperatorPolicy().level or "read_only"
-    except Exception:  # noqa: BLE001
+    except (OSError, RuntimeError, ValueError):
         return "read_only"
 
 
@@ -477,8 +480,8 @@ def model_for_profile(profile: str, hermes_root: Path | None) -> str:
                     value = stripped[len("model:"):].strip().strip("'\"")
                     if value:
                         return value
-    except Exception:  # noqa: BLE001
-        pass
+    except (OSError, RuntimeError, ValueError):
+        return ""
     return ""
 
 

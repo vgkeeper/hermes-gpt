@@ -10,7 +10,7 @@
 ## Current status
 
 - **Repository version:** 0.13.0
-- **GitHub release target:** v0.13.0
+- **Source baseline:** upstream v0.13.0; this integration branch is not a release announcement
 - **Latest PyPI release:** check the badge above; PyPI is published independently from GitHub
 - **Python requirement:** 3.10+
 - **MCP SDK (current source):** 1.28.1+ or 2.x; see [compatibility](docs/mcp-compatibility.md).
@@ -26,11 +26,11 @@ For the current documentation map and source-of-truth rules, start with [docs/RE
 
 v0.13.0 adds **Autopilot**: a durable, default-off runtime that drives one Mission through its MissionPlan (place, run in parallel, observe, validate, recover, and stop for approval) without a human re-triggering every node. It is a caller of the existing Mission, plan, placement, Work Contract, delegation, budget, and live-event surfaces and adds no authority of its own. Full guide: [docs/autopilot.md](docs/autopilot.md).
 
-1. **Three gated tools** - `hermes_autopilot_start`, `hermes_autopilot_status`, and `hermes_autopilot_stop` exist only when `HERMES_GPT_AUTOPILOT=1`; with it unset the connector surface is unchanged at 137 tools. Start is dry-run first and needs `workspace` level, direct apply mode, and `confirm=true`. A detached worker owns one Mission and survives an MCP server restart.
+1. **Three gated tools** - `hermes_autopilot_start`, `hermes_autopilot_status`, and `hermes_autopilot_stop` exist only when `HERMES_GPT_AUTOPILOT=1`; with it unset, no Autopilot tools are registered. Start is dry-run first and needs `workspace` level, direct apply mode, and `confirm=true`. A detached worker owns one Mission and survives an MCP server restart.
 2. **It never crosses an approval boundary** - approval nodes and `high_impact` nodes are never dispatched or advanced; Autopilot reports `waiting_for_owner` and dispatches nothing past them. It cannot approve or complete a Mission: it stops at `awaiting_approval`, and only `hermes_mission_approve` in Owner mode completes it.
 3. **Evidence, not claims** - a node completes only when its Work Contract validates against observed state; a worker's own success report is never accepted, and missing evidence fails closed.
 4. **Bounded everything** - concurrency, attempts per node, replans, and runtime are capped at start; new dispatch is held whenever the Mission's budget envelope is not verifiably within its limit; recovery is decided by the existing failure classifier and only transient failures are retried.
-5. **Additive elsewhere** - `hermes_autopilot_status` carries a derived summary without changing any earlier key, Flight Deck gets a read-only Autopilot view, and a failed delegation attempt can now be marked superseded by its successor (see [docs/missions.md](docs/missions.md)) without changing any approval rule.
+5. **Additive elsewhere** - `hermes_autopilot_status` carries a derived summary without changing any earlier key; when the opt-in UI is enabled, Flight Deck gets a read-only Autopilot view. A failed delegation attempt can be marked superseded by its successor (see [docs/missions.md](docs/missions.md)) without changing approval rules.
 
 See [CHANGELOG.md](CHANGELOG.md) for the complete v0.13.0 change list.
 
@@ -45,9 +45,9 @@ v0.12.0 is the vNext slice-2 release: the two designed-but-deferred mutation pat
 
 See [CHANGELOG.md](CHANGELOG.md) for the complete v0.12.0 change list.
 
-### Unreleased source features: Hermes Work Bridge and MCP Events
+### Fork additions over upstream v0.13.0
 
-The current source branch adds four authenticated Pilote adapter tools; they are not part of the v0.12.0 release or PyPI package. The bridge service remains in its own repository; see [docs/work-bridge.md](docs/work-bridge.md). This branch also prototypes the draft OpenAI MCP Events extension for protocol `2026-07-28`, advertising only the test event `hermes.test`. It is not a production event-delivery bus; see [MCP compatibility](docs/mcp-compatibility.md#openai-mcp-events-extension). The connector acceptance count on this branch is 141 (historical v0.12.0 release: 137); the Events extension does not add tools.
+This integration branch preserves the four authenticated Pilote adapter tools and Work Bridge guidance; the bridge service remains in its own repository ([docs/work-bridge.md](docs/work-bridge.md)). It projects durable Live Events to OpenAI MCP Events as wake-up notifications, not completion proof ([MCP compatibility](docs/mcp-compatibility.md#openai-mcp-events-extension)). Coding Work Contracts can explicitly select the `openhands` runner; missing auth, timeouts, and unsupported results fail closed. These are source-branch changes, not a new release or distribution claim.
 
 ## What v0.11.0 adds
 

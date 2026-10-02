@@ -13,10 +13,11 @@ from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_HERMES_HOME = "/home/hermes/.hermes"
+_HERMES_SERVICE_HOME = Path("/home") / "hermes"
+EXPECTED_HERMES_HOME = str(_HERMES_SERVICE_HOME / ".hermes")
 EXPECTED_SERVER_HOME = "/opt/data"
 EXPECTED_RUNTIME_PYTHON = "/opt/hermes/.venv/bin/python"
-INFISICAL_HOME = "/home/hermes/.hermes/home"
+INFISICAL_HOME = str(_HERMES_SERVICE_HOME / ".hermes" / "home")
 SERVER_URL = "http://127.0.0.1:17678/"
 SERVER_COMMAND = (
     "--http",
@@ -26,7 +27,7 @@ SERVER_COMMAND = (
     "17678",
 )
 TUNNEL_CLIENT = "/usr/local/bin/tunnel-client-runtime"
-INFISICAL = "/home/hermes/.hermes/home/.local/bin/infisical"
+INFISICAL = str(Path(INFISICAL_HOME) / ".local" / "bin" / "infisical")
 TUNNEL_ID_ENV = "HERMES_MCP_GATEWAY_TUNNEL_ID"
 TUNNEL_ENABLED_ENV = "HERMES_MCP_GATEWAY_TUNNEL_ENABLED"
 

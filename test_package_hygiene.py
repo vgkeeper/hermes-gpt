@@ -53,6 +53,27 @@ def test_scan_allows_placeholders_and_localhost(text):
     assert guard.scan_text(text) == []
 
 
+def test_gateway_shared_home_allowance_is_limited_to_its_entrypoint(tmp_path):
+    artifact = tmp_path / "gateway.whl"
+    with zipfile.ZipFile(artifact, "w") as archive:
+        archive.writestr(
+            "package/scripts/hermes_mcp_gateway.py",
+            'SHARED_HERMES_HOME = Path("/home/hermes/.hermes")',
+        )
+        archive.writestr("package/other.py", 'PATH = "/home/hermes/.private"')
+        archive.writestr(
+            "package/alternate/scripts/hermes_mcp_gateway.py",
+            'SHARED_HERMES_HOME = Path("/home/hermes/.hermes")\\nOTHER = "/home/hermes/.private"',
+        )
+
+    findings = guard.scan_artifact(artifact)
+    assert guard.scan_text("/home/hermes/.hermes")
+    assert not any(item[0] == "package/scripts/hermes_mcp_gateway.py" for item in findings)
+    assert any(item[0] == "package/other.py" and item[1] == "absolute_home_path" for item in findings)
+    assert any(item[0] == "package/alternate/scripts/hermes_mcp_gateway.py" for item in findings)
+
+
+
 @pytest.mark.parametrize(
     "text",
     [

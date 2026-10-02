@@ -73,6 +73,7 @@ py-modules = [
   "operator_delegations",
   "operator_job_supervisor",
   "operator_runners",
+  "operator_openhands",
   "runner_confinement",
   "operator_review",
   "operator_events",
@@ -110,6 +111,11 @@ py-modules = [
   "docs/autopilot.md",
   "docs/live-events.md",
   "docs/delegations.md",
+  "docs/hermes-mcp-gateway.md",
+  "docs/work-bridge.md",
+  "docs/session-control.md",
+  "docs/ui-security-boundary.md",
+  "docs/flight-deck-coverage.md",
   "docs/mcp-compatibility.md",
   "docs/file-export.md",
   "docs/openai-secure-mcp-tunnel.md",
@@ -119,7 +125,6 @@ py-modules = [
   "docs/release-notes-v0.4.0.md",
   "docs/codex.md",
   "docs/session-history.md",
-  "docs/session-control.md",
   "docs/updating.md",
   "docs/release-notes-v0.5.0b1.md",
   "docs/release-notes-v0.5.0b2.md",
@@ -138,6 +143,10 @@ py-modules = [
   "examples/status-hermes-gpt.example.ps1",
   "examples/install-task.example.ps1",
   "examples/fleet-authority.example.json",
+]
+"share/hermes-gpt/scripts" = [
+  "scripts/hermes_mcp_gateway.py",
+  "scripts/hermes_mcp_gateway_healthcheck.py",
 ]
 
 [tool.pytest.ini_options]

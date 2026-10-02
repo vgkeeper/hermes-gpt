@@ -45,19 +45,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
-import time
+import sqlite3
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-import operator_policy as op
 import operator_fleet as op_fleet
 import operator_mission as mission
-import operator_workspace as op_workspace
+import operator_policy as op
 import operator_runners as op_runners
 import operator_skill_resolution as skill_resolution
+import operator_workspace as op_workspace
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -65,6 +67,8 @@ import operator_skill_resolution as skill_resolution
 
 SCHEMA_VERSION = "0.6-wc.1"
 CONTRACT_SCHEMA = "hermes.work-contract/v1"
+_LOG = logging.getLogger(__name__)
+
 
 # Fleet regexes reused for identity fields.
 _AGENT_RE = op_fleet._AGENT_RE
@@ -176,23 +180,20 @@ def _audit_call(
     Never includes the objective text; only ``contract_sha256`` + ``task_id``.
     """
     policy = op.OperatorPolicy()
-    try:
-        op.audit_record(
-            tool=tool,
-            level=policy.level or "read_only",
-            apply_mode=policy.apply_mode,
-            dry_run=bool(dry_run),
-            success=bool(success),
-            changed=bool(changed),
-            summary=_truncate(summary, 500),
-            extra={
-                "contract_sha256": contract_sha256,
-                "task_id": task_id,
-                **(extra or {}),
-            },
-        )
-    except Exception:
-        pass
+    op.audit_record(
+        tool=tool,
+        level=policy.level or "read_only",
+        apply_mode=policy.apply_mode,
+        dry_run=bool(dry_run),
+        success=bool(success),
+        changed=bool(changed),
+        summary=_truncate(summary, 500),
+        extra={
+            "contract_sha256": contract_sha256,
+            "task_id": task_id,
+            **(extra or {}),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +233,7 @@ def _profile_list(value: Any) -> list[str]:
     out: list[str] = []
     for item in value:
         if not isinstance(item, str):
-            raise ValueError("profile must be a string")
+            raise TypeError("profile must be a string")
         out.append(op.validate_profile_name(item))
     return out
 
@@ -242,7 +243,7 @@ def _capability_requirement(value: Any) -> dict[str, Any] | None:
     if value is None:
         return None
     if not isinstance(value, dict):
-        raise ValueError("capability_req must be an object")
+        raise TypeError("capability_req must be an object")
     profile = op.validate_profile_name(
         _clean_text(value.get("profile"), field="capability_req.profile", maximum=64)
     )
@@ -267,7 +268,7 @@ def _forbidden_list(value: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for item in value:
         if not isinstance(item, dict):
-            raise ValueError("forbidden action must be an object")
+            raise TypeError("forbidden action must be an object")
         action = _clean_text(item.get("action"), field="forbidden action", maximum=128)
         reason = _clean_text(item.get("reason", ""), field="forbidden reason", maximum=500, required=False)
         klass = str(item.get("class", "HIGH")).upper()
@@ -304,7 +305,7 @@ def _artifact_list(value: Any, workspaces: list[Path]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for item in value:
         if not isinstance(item, dict):
-            raise ValueError("expected artifact must be an object")
+            raise TypeError("expected artifact must be an object")
         path = _clean_text(item.get("path"), field="artifact path", maximum=1000)
         _resolve_artifact_paths(path, workspaces)  # validates no escape / no denied
         must_exist = bool(item.get("must_exist", True))
@@ -322,7 +323,7 @@ def _test_list(value: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for item in value:
         if not isinstance(item, dict):
-            raise ValueError("test must be an object")
+            raise TypeError("test must be an object")
         name = _clean_text(item.get("name"), field="test name", maximum=200)
         command = _clean_text(item.get("command"), field="test command", maximum=1000)
         try:
@@ -341,7 +342,7 @@ def _review_requirements(value: Any) -> dict[str, Any]:
     if value is None:
         return {"required": False, "reviewer": "", "evidence": "", "approval_required": False}
     if not isinstance(value, dict):
-        raise ValueError("review_requirements must be an object")
+        raise TypeError("review_requirements must be an object")
     required = bool(value.get("required", False))
     reviewer = _clean_text(value.get("reviewer", ""), field="reviewer", maximum=128, required=False)
     evidence = _clean_text(value.get("evidence", ""), field="review evidence", maximum=500, required=False)
@@ -356,10 +357,10 @@ def _review_requirements(value: Any) -> dict[str, Any]:
 
 def _completion_criteria(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
-        raise ValueError("completion_criteria must be an object")
+        raise TypeError("completion_criteria must be an object")
     run_state = value.get("run_state")
     if not isinstance(run_state, dict):
-        raise ValueError("completion_criteria.run_state must be an object")
+        raise TypeError("completion_criteria.run_state must be an object")
     outcome_ok = run_state.get("outcome_ok")
     if not isinstance(outcome_ok, list) or not outcome_ok or any(not isinstance(x, str) for x in outcome_ok):
         raise ValueError("completion_criteria.run_state.outcome_ok must be a non-empty string list")
@@ -380,7 +381,7 @@ def _canonical_contract(raw: Any) -> tuple[str, dict[str, Any]]:
     PermissionError on schema, scope, or authorization violations.
     """
     if not isinstance(raw, dict):
-        raise ValueError("contract must be a JSON object")
+        raise TypeError("contract must be a JSON object")
     if raw.get("schema") != CONTRACT_SCHEMA:
         raise ValueError(f"contract schema must be {CONTRACT_SCHEMA!r}")
 
@@ -400,7 +401,7 @@ def _canonical_contract(raw: Any) -> tuple[str, dict[str, Any]]:
 
     scope = raw.get("allowed_scope")
     if not isinstance(scope, dict):
-        raise ValueError("allowed_scope must be an object")
+        raise TypeError("allowed_scope must be an object")
     workspaces = _workspace_list(scope.get("workspaces"))
     profiles = _profile_list(scope.get("profiles"))
 
@@ -524,7 +525,7 @@ def _contract_from_validation_manifest(manifest: dict[str, Any]) -> tuple[dict[s
     if not re.fullmatch(r"[0-9a-f]{64}", sha) or not re.fullmatch(r"[0-9a-f]{64}", context_sha):
         raise ValueError("validation manifest digest is invalid")
     if not isinstance(context, dict):
-        raise ValueError("validation manifest context is invalid")
+        raise TypeError("validation manifest context is invalid")
     encoded = json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     if hashlib.sha256(encoded.encode("utf-8")).hexdigest() != context_sha:
         raise ValueError("validation manifest context digest mismatch")
@@ -603,7 +604,7 @@ def _surface_contract(contract: dict[str, Any]) -> dict[str, Any]:
         options = contract["execution"].get("options") or {}
         surf["execution"] = {
             "backend": contract["execution"].get("backend"),
-            "option_keys": sorted(str(k) for k in options.keys()),
+            "option_keys": sorted(str(k) for k in options),
         }
     return surf
 
@@ -617,7 +618,7 @@ def _observed_kanban_runs(task_id: str, hermes_root: Path) -> list[dict[str, Any
     warnings: list[str] = []
     try:
         runs = mission._kanban_runs_for(hermes_root, warnings)
-    except Exception:
+    except (OSError, sqlite3.Error, ValueError):
         return []
     return [
         {
@@ -652,8 +653,8 @@ def _observed_delegations(task_id: str, hermes_root: Path) -> list[dict[str, Any
                             "scope": d.get("scope"),
                         }
                     )
-        except Exception:
-            continue
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            _LOG.warning("contract delegation observation failed error=%s", type(exc).__name__)
     return out
 
 
@@ -899,7 +900,7 @@ def _check_tests(contract: dict[str, Any], runner: Callable[..., tuple[int, str,
                 runner=runner,
             )
             payload = json.loads(out)
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             return {
                 "kind": "tests",
                 "status": "FAIL",
@@ -974,7 +975,9 @@ def _check_review(contract: dict[str, Any], contract_sha256: str, hermes_root: P
     # contract's assigned_agent.
     try:
         import operator_review as op_review
-
+    except ImportError:
+        op_review = None
+    if op_review is not None:
         for rec in op_review.read_review_acceptances(hermes_root):
             if rec.get("contract_sha256") != contract_sha256:
                 continue
@@ -987,8 +990,6 @@ def _check_review(contract: dict[str, Any], contract_sha256: str, hermes_root: P
                     "status": "PASS",
                     "detail": f"review-evidence acceptance by reviewer {reviewer} != assignee",
                 }
-    except Exception:
-        pass
     # Evidence 2: human approval reference by someone other than the assignee.
     auth = contract.get("authorization") or {}
     approved_by = auth.get("approved_by") or ""
@@ -1080,7 +1081,7 @@ def _check_forbidden(
 
     identities = _attributable_identities(contract)
     task_id = contract["task_id"]
-    labels = [fa["action"].lower() for fa in forbidden]
+    [fa["action"].lower() for fa in forbidden]
     signals: list[dict[str, Any]] = []
 
     # Audit trail scan (D5): scope strictly to this contract's task identity.
@@ -1215,7 +1216,7 @@ def hermes_contract_define(contract_json: str, hermes_root: Path | None = None) 
     tool = "hermes_contract_define"
     tid = op.new_trace_id()
     try:
-        canonical, contract, sha = _parse_contract(contract_json)
+        _canonical, contract, sha = _parse_contract(contract_json)
     except PermissionError as exc:
         payload = _contract_error(
             code="CONTRACT_DENIED",
@@ -1296,7 +1297,7 @@ def hermes_contract_dispatch(
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
     try:
-        canonical, contract, sha = _parse_contract(contract_json)
+        _canonical, contract, sha = _parse_contract(contract_json)
     except (ValueError, TypeError, PermissionError) as exc:
         payload = _contract_error(
             code="INVALID_CONTRACT",
@@ -1422,8 +1423,8 @@ def _validate_impl(contract: dict[str, Any], sha: str, runner: Callable[..., tup
             # Valid contract + no observed run at all -> INCONCLUSIVE (D7 §7.3).
             verdict = _VERDICT_INCONCLUSIVE
             rejected = [
-                "no observed run/outcome for "
-                f"{contract['task_id']}; cannot confirm completion (fail-closed)"
+                ("no observed run/outcome for "
+                f"{contract['task_id']}; cannot confirm completion (fail-closed)")
             ]
             false_done = True
         else:
@@ -1482,7 +1483,7 @@ def hermes_contract_validate(
     tid = op.new_trace_id()
     root = _resolve_root(hermes_root)
     try:
-        canonical, contract, sha = _parse_contract(contract_json)
+        _canonical, contract, sha = _parse_contract(contract_json)
     except (ValueError, TypeError, PermissionError) as exc:
         payload = {
             "schema_version": SCHEMA_VERSION,
@@ -1527,7 +1528,7 @@ def hermes_contract_status(contract_json: str, hermes_root: Path | None = None) 
     tid = op.new_trace_id()
     root = _resolve_root(hermes_root)
     try:
-        canonical, contract, sha = _parse_contract(contract_json)
+        _canonical, contract, sha = _parse_contract(contract_json)
     except (ValueError, TypeError, PermissionError) as exc:
         payload = _contract_error(
             code="INVALID_CONTRACT",

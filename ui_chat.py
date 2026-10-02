@@ -37,12 +37,14 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import threading
 import time
 import uuid
 from collections import deque
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, AsyncIterator, Deque, Dict, List, Optional, Tuple
+from typing import Any
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -64,6 +66,8 @@ DEFAULT_MAX_CONCURRENT = 4
 TURN_RETENTION_S = 1800.0
 # SSE replay/tail heartbeat interval (keeps proxies from closing idle streams).
 SSE_HEARTBEAT_S = 15.0
+_SESSION_DB_ERRORS = (OSError, RuntimeError, ValueError, sqlite3.Error)
+
 # Bounded event ring per turn (reconnect replay never grows unbounded).
 TURN_EVENT_RING_MAX = 4096
 MESSAGE_PAGE_LIMIT = 500
@@ -84,16 +88,16 @@ class Turn:
         self.turn_id = turn_id
         self.holder = holder
         self.seq = 0
-        self.events: Deque[Tuple[int, str, dict]] = deque()
+        self.events: deque[tuple[int, str, dict]] = deque()
         self.cond = threading.Condition()
         self.agent: Any = None
         self.started_at = time.time()
-        self.finished_at: Optional[float] = None
-        self.finish_reason: Optional[str] = None
-        self.error: Optional[str] = None
+        self.finished_at: float | None = None
+        self.finish_reason: str | None = None
+        self.error: str | None = None
         self.done = False
         self.cancel_requested = False
-        self.tool_times: Dict[str, float] = {}
+        self.tool_times: dict[str, float] = {}
 
     def publish(self, event: str, data: dict) -> None:
         with self.cond:
@@ -103,7 +107,7 @@ class Turn:
                 self.events.popleft()
             self.cond.notify_all()
 
-    def mark_done(self, finish_reason: str, error: Optional[str] = None) -> None:
+    def mark_done(self, finish_reason: str, error: str | None = None) -> None:
         with self.cond:
             self.done = True
             self.finish_reason = finish_reason
@@ -111,7 +115,7 @@ class Turn:
             self.finished_at = time.time()
             self.cond.notify_all()
 
-    def snapshot_after(self, after: int, timeout: Optional[float] = None) -> Tuple[List[Tuple[int, str, dict]], bool]:
+    def snapshot_after(self, after: int, timeout: float | None = None) -> tuple[list[tuple[int, str, dict]], bool]:
         """Return ``(events with seq > after, done)``; block up to ``timeout``.
 
         Blocks on the condition variable when nothing new is available, so a
@@ -132,7 +136,7 @@ class Turn:
 
 
 _turns_lock = threading.Lock()
-_turns: Dict[str, Turn] = {}
+_turns: dict[str, Turn] = {}
 
 
 def _register_turn(turn: Turn) -> None:
@@ -141,7 +145,7 @@ def _register_turn(turn: Turn) -> None:
         _turns[turn.session_id] = turn
 
 
-def _get_turn(session_id: str, turn_id: Optional[str] = None) -> Optional[Turn]:
+def _get_turn(session_id: str, turn_id: str | None = None) -> Turn | None:
     with _turns_lock:
         turn = _turns.get(session_id)
         if turn is None:
@@ -151,7 +155,7 @@ def _get_turn(session_id: str, turn_id: Optional[str] = None) -> Optional[Turn]:
         return turn
 
 
-def _active_turn(session_id: str) -> Optional[Turn]:
+def _active_turn(session_id: str) -> Turn | None:
     turn = _get_turn(session_id)
     if turn is not None and not turn.done:
         return turn
@@ -190,15 +194,9 @@ def _session_db() -> Any:
     if _session_db_instance is None:
         with _session_db_lock:
             if _session_db_instance is None:
-                try:
-                    from hermes_state import SessionDB
+                from hermes_state import SessionDB
 
-                    _session_db_instance = SessionDB(db_path=_hermes_home() / "state.db")
-                except Exception as exc:
-                    logger.warning("ui_chat: hermes_state.SessionDB unavailable (%s), using local shim", exc)
-                    from hermes_state import SessionDB as ShimSessionDB
-
-                    _session_db_instance = ShimSessionDB(db_path=_hermes_home() / "state.db")
+                _session_db_instance = SessionDB(db_path=_hermes_home() / "state.db")
     return _session_db_instance
 
 
@@ -226,19 +224,19 @@ def _resolve_model() -> str:
         from gateway.run import _load_gateway_config, _resolve_gateway_model
 
         return _resolve_gateway_model(_load_gateway_config()) or ""
-    except Exception:
+    except (ImportError, OSError, RuntimeError, ValueError):
         logger.debug("ui_chat: model resolution unavailable", exc_info=True)
         return ""
 
 
-def _resolve_toolsets() -> Optional[List[str]]:
+def _resolve_toolsets() -> list[str] | None:
     """Resolve the CLI default toolset set for the agent (gateway-style)."""
     try:
         from gateway.run import _load_gateway_config
         from hermes_cli.tools_config import _get_platform_tools
 
         return sorted(_get_platform_tools(_load_gateway_config(), "cli"))
-    except Exception:
+    except (ImportError, OSError, RuntimeError, ValueError):
         logger.debug("ui_chat: toolset resolution unavailable", exc_info=True)
         return None
 
@@ -246,7 +244,7 @@ def _resolve_toolsets() -> Optional[List[str]]:
 def _session_exists(db: Any, session_id: str) -> bool:
     try:
         return db.get_session(session_id) is not None
-    except Exception:
+    except _SESSION_DB_ERRORS:
         return False
 
 
@@ -261,7 +259,7 @@ def _create_session(db: Any, *, model: str, profile: str) -> str:
     return session_id
 
 
-def _serialize_session(row: Dict[str, Any]) -> Dict[str, Any]:
+def _serialize_session(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "session_id": row.get("id"),
         "title": row.get("title") or "",
@@ -319,7 +317,7 @@ def _safe_tool_brief(name: str, args: Any) -> str:
             else:
                 try:
                     rendered = json.dumps(value, ensure_ascii=False)[:120]
-                except Exception:
+                except (TypeError, ValueError):
                     rendered = "…"
                 safe_parts.append(f"{key}={rendered}")
         brief = ", ".join(safe_parts)
@@ -331,7 +329,7 @@ def _safe_tool_brief(name: str, args: Any) -> str:
 
 # ── Message mapping ───────────────────────────────────────────────────────
 
-def _parse_tool_calls(raw: Any) -> Optional[List[dict]]:
+def _parse_tool_calls(raw: Any) -> list[dict] | None:
     if not raw:
         return None
     try:
@@ -353,10 +351,10 @@ def _parse_tool_calls(raw: Any) -> Optional[List[dict]]:
     return out or None
 
 
-def _serialize_message(row: Dict[str, Any]) -> Dict[str, Any]:
+def _serialize_message(row: dict[str, Any]) -> dict[str, Any]:
     role = row.get("role") or ""
     finish_reason = row.get("finish_reason")
-    base: Dict[str, Any] = {
+    base: dict[str, Any] = {
         "message_id": row.get("id"),
         "role": role,
         "content": row.get("content") or "",
@@ -377,7 +375,7 @@ def _serialize_message(row: Dict[str, Any]) -> Dict[str, Any]:
 
 # ── Agent turn execution ──────────────────────────────────────────────────
 
-def _make_stream_callbacks(turn: Turn) -> Tuple[Any, Any, Any, Any]:
+def _make_stream_callbacks(turn: Turn) -> tuple[Any, Any, Any, Any]:
     """Build the stream callbacks that translate agent events into SSE events.
 
     Extracted from ``_build_agent`` so tests can drive the exact SSE event
@@ -402,13 +400,13 @@ def _make_stream_callbacks(turn: Turn) -> Tuple[Any, Any, Any, Any]:
 
     def on_tool_complete(call_id: str, name: str, display_args: Any, result: Any) -> None:
         started = turn.tool_times.pop(call_id, None)
-        duration_ms = int(round((time.monotonic() - started) * 1000)) if started else None
+        duration_ms = round((time.monotonic() - started) * 1000) if started else None
         if isinstance(result, str):
             summary = _redact_text(result)
         else:
             try:
                 summary = _redact_text(json.dumps(result, ensure_ascii=False, default=str))
-            except Exception:
+            except (TypeError, ValueError):
                 summary = ""
         turn.publish("tool_end", {
             "call_id": call_id,
@@ -455,10 +453,10 @@ def _execute_turn(agent: Any, turn: Turn, *, message: str, db: Any) -> dict:
     return agent.run_conversation(user_message=message, task_id=turn.session_id)
 
 
-def _latest_message_id(db: Any, session_id: str, role: Optional[str] = None) -> Optional[int]:
+def _latest_message_id(db: Any, session_id: str, role: str | None = None) -> int | None:
     try:
         rows = db.get_messages(session_id, include_compacted=True, limit=1, latest=True)
-    except Exception:
+    except _SESSION_DB_ERRORS:
         return None
     if role is not None:
         for row in rows:
@@ -468,7 +466,7 @@ def _latest_message_id(db: Any, session_id: str, role: Optional[str] = None) -> 
     return rows[0].get("id") if rows else None
 
 
-def _finalize_turn(turn: Turn, result: Optional[dict], db: Any) -> None:
+def _finalize_turn(turn: Turn, result: dict | None, db: Any) -> None:
     result = result or {}
     interrupted = bool(result.get("interrupted"))
     failed = bool(result.get("failed"))
@@ -505,15 +503,15 @@ def _run_turn(turn: Turn, *, message: str, profile: str, model: str, db: Any, ho
         logger.error("ui_chat: agent imports unavailable: %s", exc)
         turn.publish("error", {"code": "IMPORT_UNAVAILABLE", "message": "Hermes agent imports are unavailable in this install."})
         turn.mark_done("error", error=str(exc))
-    except Exception as exc:  # noqa: BLE001 — turn must always close cleanly
+    except Exception as exc:
         logger.exception("ui_chat: turn failed for session %s", turn.session_id)
         turn.publish("error", {"code": "INTERNAL", "message": str(exc) or exc.__class__.__name__})
         turn.mark_done("error", error=str(exc))
     finally:
         try:
             db.release_session_turn_lease(turn.session_id, holder)
-        except Exception:
-            logger.debug("ui_chat: lease release failed (already free?)", exc_info=True)
+        except _SESSION_DB_ERRORS as exc:
+            logger.debug("ui_chat: lease release failed error=%s", type(exc).__name__)
         turn.agent = None
 
 
@@ -533,36 +531,28 @@ _SSE_HEADERS = {
 
 async def _sse_generator(turn: Turn) -> AsyncIterator[str]:
     last = 0
-    try:
-        while True:
-            batch, done = await asyncio.to_thread(turn.snapshot_after, last, SSE_HEARTBEAT_S)
-            for seq, event, data in batch:
-                yield _format_sse(event, seq, data)
-                last = seq
-            if done and last >= turn.seq:
-                return
-            if not batch:
-                yield ": ping\n\n"
-    except asyncio.CancelledError:
-        # Client disconnected — the turn keeps running in its worker thread
-        # and remains reachable via GET /api/chat/stream (replay + tail).
-        raise
+    while True:
+        batch, done = await asyncio.to_thread(turn.snapshot_after, last, SSE_HEARTBEAT_S)
+        for seq, event, data in batch:
+            yield _format_sse(event, seq, data)
+            last = seq
+        if done and last >= turn.seq:
+            return
+        if not batch:
+            yield ": ping\n\n"
 
 
 async def _replay_generator(turn: Turn, after: int) -> AsyncIterator[str]:
     last = after
-    try:
-        while True:
-            batch, done = await asyncio.to_thread(turn.snapshot_after, last, SSE_HEARTBEAT_S)
-            for seq, event, data in batch:
-                yield _format_sse(event, seq, data)
-                last = seq
-            if done and last >= turn.seq:
-                return
-            if not batch:
-                yield ": ping\n\n"
-    except asyncio.CancelledError:
-        raise
+    while True:
+        batch, done = await asyncio.to_thread(turn.snapshot_after, last, SSE_HEARTBEAT_S)
+        for seq, event, data in batch:
+            yield _format_sse(event, seq, data)
+            last = seq
+        if done and last >= turn.seq:
+            return
+        if not batch:
+            yield ": ping\n\n"
 
 
 # ── Envelope helpers ──────────────────────────────────────────────────────
@@ -587,8 +577,8 @@ async def _handle_sessions_list(request: Request) -> Response:
             include_archived=False,
             limit=SESSION_LIST_LIMIT,
         )
-    except Exception as exc:
-        logger.warning("ui_chat: session list failed: %s", exc)
+    except _SESSION_DB_ERRORS as exc:
+        logger.warning("ui_chat: session list failed (%s)", type(exc).__name__)
         return _error(500, "INTERNAL", "Failed to list sessions")
     sessions = [_serialize_session(dict(row)) for row in rows]
     return _ok({"sessions": sessions})
@@ -609,8 +599,8 @@ async def _handle_session_messages(request: Request) -> Response:
         return _error(404, "NOT_FOUND", "session not found")
     try:
         rows = db.get_messages(session_id, include_compacted=True, limit=MESSAGE_PAGE_LIMIT)
-    except Exception as exc:
-        logger.warning("ui_chat: message read failed: %s", exc)
+    except _SESSION_DB_ERRORS as exc:
+        logger.warning("ui_chat: message read failed (%s)", type(exc).__name__)
         return _error(500, "INTERNAL", "Failed to load messages")
     messages = [_serialize_message(dict(row)) for row in rows]
     return _ok({"messages": messages})
@@ -619,7 +609,7 @@ async def _handle_session_messages(request: Request) -> Response:
 async def _handle_chat_post(request: Request) -> Response:
     try:
         body = await request.json()
-    except Exception:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return _error(400, "BAD_REQUEST", "Request body must be JSON")
     if not isinstance(body, dict):
         return _error(400, "BAD_REQUEST", "Request body must be a JSON object")
@@ -688,7 +678,7 @@ async def _handle_chat_stream(request: Request) -> Response:
 async def _handle_chat_stop(request: Request) -> Response:
     try:
         body = await request.json()
-    except Exception:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return _error(400, "BAD_REQUEST", "Request body must be JSON")
     session_id = str((body or {}).get("session_id") or "").strip()
     if not session_id:
@@ -701,14 +691,14 @@ async def _handle_chat_stop(request: Request) -> Response:
     if agent is not None and hasattr(agent, "interrupt"):
         try:
             agent.interrupt(hard_cancel=True)
-        except Exception:
-            logger.debug("ui_chat: interrupt call failed", exc_info=True)
+        except (OSError, RuntimeError) as exc:
+            logger.debug("ui_chat: interrupt call failed error=%s", type(exc).__name__)
     return _ok({"stopped": True})
 
 
 # ── Route registration ────────────────────────────────────────────────────
 
-def ui_chat_routes() -> List[Route]:
+def ui_chat_routes() -> list[Route]:
     """Chat + sessions routes composed by ``ui_api.routes()``."""
     return [
         Route("/api/sessions", _handle_sessions_list, methods=["GET"]),

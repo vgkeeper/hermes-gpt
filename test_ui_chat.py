@@ -8,7 +8,6 @@ persistence are all exercised end-to-end without any LLM call.
 
 from __future__ import annotations
 
-import os
 import sys
 import threading
 import time
@@ -28,8 +27,7 @@ from starlette.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import ui_chat  # noqa: E402
-
+import ui_chat
 
 # ── Test doubles ──────────────────────────────────────────────────────────
 
@@ -52,7 +50,7 @@ class StubAgent:
         self.interrupted.set()
 
     def run_conversation(self, user_message, task_id=None, **kwargs):
-        on_token, on_reasoning, on_tool_start, on_tool_complete = self._callbacks
+        on_token, _on_reasoning, on_tool_start, on_tool_complete = self._callbacks
         self.db.append_message(self.session_id, "user", content=user_message)
         if self.block_event is not None:
             while not self.interrupted.is_set() and not self.block_event.is_set():

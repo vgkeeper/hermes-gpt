@@ -101,7 +101,7 @@ def test_mission_surface_envelope_shape(client, surface):
     assert not re.search(r"(?i)\bsk(?:-proj)?-[A-Za-z0-9_-]{20,}\b", serialized)
     assert "AKIA" not in serialized
     assert "Bearer " not in serialized
-    assert "prompt_sha256" in serialized or "counts" in serialized or True  # shape-tolerant
+    assert True  # shape-tolerant
 
 
 _SECRET_SCAN_RE = re.compile(r"(?i)\bsk(?:-proj)?-[A-Za-z0-9_-]{20,}\b")

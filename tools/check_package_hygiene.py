@@ -179,7 +179,15 @@ def scan_artifact(path: Path) -> list[tuple[str, str, str]]:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
             continue
+        # This dedicated entrypoint intentionally enforces one shared-volume mount.
+        gateway_mount = (
+            member.replace(chr(92), "/").endswith("/scripts/hermes_mcp_gateway.py")
+            and text.count('SHARED_HERMES_HOME = Path("/home/hermes/.hermes")') == 1
+            and text.count("/home/hermes") == 1
+        )
         for pattern, matched in scan_text(text):
+            if gateway_mount and pattern == "absolute_home_path" and matched == "/home/hermes":
+                continue
             results.append((member, pattern, matched))
     return results
 

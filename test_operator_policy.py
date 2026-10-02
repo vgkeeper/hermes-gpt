@@ -12,7 +12,6 @@ import pytest
 
 import operator_policy as op
 
-
 # ---------------------------------------------------------------------------
 # Truthy helper
 # ---------------------------------------------------------------------------
@@ -489,7 +488,7 @@ def test_redact_output_removes_raw_secret_values(text):
 
 
 def test_run_argv_runs_without_shell(tmp_path):
-    rc, out, err = op.run_argv(
+    rc, out, _err = op.run_argv(
         [sys.executable, "-c", "print('hello')"], timeout=10, workdir=str(tmp_path)
     )
     assert rc == 0
@@ -531,7 +530,7 @@ def test_run_argv_refuses_empty_argv():
 
 
 def test_run_argv_handles_missing_executable():
-    rc, out, err = op.run_argv(["this-binary-does-not-exist-xyz"], timeout=5)
+    rc, _out, err = op.run_argv(["this-binary-does-not-exist-xyz"], timeout=5)
     assert rc == 127
     assert err  # non-empty error
 
@@ -542,13 +541,14 @@ def test_run_argv_timeout_kills_descendant_process_group(tmp_path):
 
     pid_file = tmp_path / "child.pid"
     parent_script = (
-        "import pathlib, subprocess, sys, time; "
+        "import pathlib, signal, subprocess, sys, time; "
         "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
         "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+        "signal.signal(signal.SIGTERM, lambda *_: (child.wait(), sys.exit(0))); "
         "time.sleep(60)"
     )
 
-    rc, out, err = op.run_argv(
+    rc, _out, err = op.run_argv(
         [sys.executable, "-c", parent_script, str(pid_file)],
         timeout=1,
         workdir=str(tmp_path),

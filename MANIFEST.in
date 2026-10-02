@@ -5,7 +5,14 @@ include CHANGELOG.md
 # (docs/design/*, docs/releases/*) are intentionally NOT distributed.
 include docs/README.md
 include docs/hermes-mcp-gateway.md
+include docs/openai-secure-mcp-tunnel.md
+include docs/work-bridge.md
+include docs/session-control.md
+include docs/ui-security-boundary.md
+include docs/flight-deck-coverage.md
 include docs/codex.md
+include scripts/hermes_mcp_gateway.py
+include scripts/hermes_mcp_gateway_healthcheck.py
 include docs/operator-mode.md
 include docs/mcp-compatibility.md
 include docs/oauth.md
@@ -23,7 +30,7 @@ include docs/updating.md
 include docs/windows-chatgpt-codex.md
 include docs/gemini-spark.md
 include docs/autopilot.md
-recursive-include examples *.ps1
+recursive-include examples *.ps1 *.json
 prune docs/design
 prune docs/releases
 prune logs

@@ -8,7 +8,7 @@ This is the current operational guide. `docs/design/v0.13-autopilot.md` records 
 
 Autopilot needs both of these, in addition to the normal Operator policy:
 
-- the machine gate `HERMES_GPT_AUTOPILOT=1` (read live; unset means off). While it is unset the three tools below are **not registered**, so the default connector surface is unchanged at 137 tools; with it set there are three more.
+- the machine gate `HERMES_GPT_AUTOPILOT=1` (read live; unset means off). While it is unset the three tools below are **not registered**, so the connector surface is unchanged; with it set there are three more. The 137-tool count is the upstream v0.13 baseline; this fork adds four Pilote adapter tools independently.
 - per call: Operator `workspace` level, direct apply mode, `dry_run=false`, and `confirm=true`. A dry run previews the start and writes nothing.
 
 ## Tools

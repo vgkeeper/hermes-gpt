@@ -32,6 +32,13 @@ Filesystem authority is enforced externally by the same Hermes confinement layer
 
 Provider authorization stays in the trusted Hermes worker. The confined OpenCode process receives a fresh per-job random relay capability and a sanitized provider configuration; the loopback relay rejects missing or incorrect capabilities before forwarding and substitutes the upstream authorization only after that check. The upstream authorization is never serialized into the child config, argv, workspace, or child environment.
 
+## OpenHands Cloud runner
+
+Coding Work Contracts may explicitly select `execution.backend=openhands`; this is not a fallback target. The contract's execution options must include an explicit `repository` slug and `branch`. Normal Operator direct-mode, workspace-level, dry-run, confirmation, Work Contract, and delegation gates still apply. Credentials are injected at runtime through `OPENHANDS_CLOUD_API_KEY` (or `OPENHANDS_API_KEY`) and are never written to runner metadata; the optional `HERMES_GPT_OPENHANDS_BASE_URL` must be HTTPS. No live job is required to configure or test the backend.
+
+OpenHands start-task and conversation status are observed across server restarts. Missing auth, timeout, API errors, and unknown result/status shapes produce bounded failure or `needs_attention`; they never become successful Work Contract evidence. There is no automatic fallback to Codex, OpenCode, Pi, OMX, or Fleet. Work Contract validation remains authoritative. Cancellation is reported unsupported rather than guessed.
+
+
 ## Live events
 
 Delegation lifecycle changes publish bounded wake-up events on the v0.9 live-event bus. These notifications are non-authoritative pointers back to durable delegation/runner/Fabric state; notification failure cannot advance or complete work.

@@ -78,15 +78,16 @@ import os
 import re
 import threading
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-import operator_policy as op
-import operator_fleet as op_fleet
-import operator_contract as contract_mod
-import operator_mission as mission
 import operator_codex as op_codex
+import operator_contract as contract_mod
+import operator_fleet as op_fleet
+import operator_mission as mission
+import operator_policy as op
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -227,25 +228,22 @@ def _audit_call(
     Never includes objective text; only workflow_id/stage/owner/verdict.
     """
     policy = op.OperatorPolicy()
-    try:
-        op.audit_record(
-            tool=tool,
-            level=policy.level or "read_only",
-            apply_mode=policy.apply_mode,
-            dry_run=bool(dry_run),
-            success=bool(success),
-            changed=bool(changed),
-            summary=_truncate(summary, 500),
-            extra={
-                "workflow_id": workflow_id,
-                "stage_id": stage_id,
-                "owner": owner,
-                "verdict": verdict,
-                **(extra or {}),
-            },
-        )
-    except Exception:
-        pass
+    op.audit_record(
+        tool=tool,
+        level=policy.level or "read_only",
+        apply_mode=policy.apply_mode,
+        dry_run=bool(dry_run),
+        success=bool(success),
+        changed=bool(changed),
+        summary=_truncate(summary, 500),
+        extra={
+            "workflow_id": workflow_id,
+            "stage_id": stage_id,
+            "owner": owner,
+            "verdict": verdict,
+            **(extra or {}),
+        },
+    )
     # v0.9 wake-up channel. Swarm JSON/audit state remains authoritative;
     # notification failure is non-fatal and never advances work.
     try:
@@ -268,7 +266,7 @@ def _audit_call(
             },
             hermes_root=_default_hermes_root(),
         )
-    except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+    except (ImportError, OSError, RuntimeError, ValueError):
         return
 
 
@@ -344,7 +342,7 @@ def _stage_id_list(value: Any, *, known: set[str], field: str) -> list[str]:
     if value is None:
         return []
     if not isinstance(value, list):
-        raise ValueError(f"{field} must be a list of stage ids")
+        raise TypeError(f"{field} must be a list of stage ids")
     out: list[str] = []
     for item in value:
         if not isinstance(item, str) or not _STAGE_ID_RE.fullmatch(item):
@@ -369,7 +367,7 @@ def _validate_stage_defs(stages: Any, workflow: dict[str, Any]) -> None:
     known: set[str] = set()
     for idx, stage in enumerate(stages):
         if not isinstance(stage, dict):
-            raise ValueError(f"stage[{idx}] must be an object")
+            raise TypeError(f"stage[{idx}] must be an object")
         stage_id = _clean_text(stage.get("id"), field="stage id", maximum=64)
         if not _STAGE_ID_RE.fullmatch(stage_id):
             raise ValueError(f"stage id {stage_id!r} is invalid")
@@ -439,7 +437,7 @@ def _canonical_workflow(raw: Any) -> tuple[str, dict[str, Any]]:
     PermissionError on schema, DAG, or cap violations.
     """
     if not isinstance(raw, dict):
-        raise ValueError("workflow must be a JSON object")
+        raise TypeError("workflow must be a JSON object")
     if raw.get("schema") != WORKFLOW_SCHEMA:
         raise ValueError(f"workflow schema must be {WORKFLOW_SCHEMA!r}")
 
@@ -477,7 +475,7 @@ def _canonical_workflow(raw: Any) -> tuple[str, dict[str, Any]]:
             raise ValueError("expected_artifacts must be a list (<= 32)")
         for art in artifacts:
             if not isinstance(art, dict):
-                raise ValueError("expected artifact must be an object")
+                raise TypeError("expected artifact must be an object")
         cleaned["expected_artifacts"] = list(artifacts)
 
         tests = stage.get("tests") or []
@@ -485,7 +483,7 @@ def _canonical_workflow(raw: Any) -> tuple[str, dict[str, Any]]:
             raise ValueError("tests must be a list (<= 16)")
         for t in tests:
             if not isinstance(t, dict):
-                raise ValueError("test must be an object")
+                raise TypeError("test must be an object")
         cleaned["tests"] = list(tests)
 
         forbidden = stage.get("forbidden_actions") or []
@@ -1119,15 +1117,12 @@ def hermes_swarm_workflow_status(workflow_id: str, hermes_root: Path | None = No
 
     # Observed kanban runs per stage task_id (bounded, redacted).
     observed_by_task: dict[str, list[dict[str, Any]]] = {}
-    try:
-        warnings: list[str] = []
-        runs = mission._kanban_runs_for(root, warnings)
-        for r in runs:
-            observed_by_task.setdefault(str(r.get("task_id") or ""), []).append(
-                {"status": r.get("status"), "outcome": r.get("outcome"), "board": r.get("board")}
-            )
-    except Exception:
-        pass
+    warnings: list[str] = []
+    runs = mission._kanban_runs_for(root, warnings)
+    for r in runs:
+        observed_by_task.setdefault(str(r.get("task_id") or ""), []).append(
+            {"status": r.get("status"), "outcome": r.get("outcome"), "board": r.get("board")}
+        )
 
     stages: list[dict[str, Any]] = []
     for st in record.get("stages", []):
@@ -1481,7 +1476,7 @@ def hermes_swarm_stage_advance(
             target = f"base:{plan['branch']}"
         try:
             review_evidence = reviewer(workdir=plan["path"] if plan else workflow["workspace"], target=target, instructions="", timeout=900)
-        except Exception as exc:
+        except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
             review_evidence = {"status": "error", "verdict": "UNKNOWN", "detail": _truncate(op.redact_output(str(exc)), 300)}
         if review_evidence and review_evidence.get("status") == "refused":
             payload = _swarm_error(code="CODEX_REVIEW_REFUSED", safe_message=op.redact_output(str(review_evidence.get("detail") or "refused"))[:300],

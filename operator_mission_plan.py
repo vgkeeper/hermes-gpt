@@ -286,7 +286,7 @@ def _clean_capability_req(value: Any) -> dict[str, Any]:
     if value is None:
         value = {}
     if not isinstance(value, dict):
-        raise ValueError("capability_req must be an object")
+        raise TypeError("capability_req must be an object")
     profile = _clean_profile(value.get("profile"), field="capability_req.profile")
     skills = _clean_skills(value.get("skills"))
     klass = str(value.get("authorization_class", "reversible_write")).strip().lower()
@@ -299,7 +299,7 @@ def _clean_budget(value: Any) -> dict[str, int]:
     if value is None:
         value = {}
     if not isinstance(value, dict):
-        raise ValueError("budget must be an object")
+        raise TypeError("budget must be an object")
     minutes = int(value.get("est_minutes", 0) or 0)
     tokens = int(value.get("est_tokens", 0) or 0)
     if minutes < 0 or minutes > MAX_BUDGET_MINUTES:
@@ -372,7 +372,7 @@ def _validate_node_dag(nodes: list[dict[str, Any]], *, uuid: set[str]) -> None:
 def _canonical_node(raw: Any) -> dict[str, Any]:
     """Validate + canonicalize one plan node (definition only — no state)."""
     if not isinstance(raw, dict):
-        raise ValueError("each plan node must be an object")
+        raise TypeError("each plan node must be an object")
     node_id = _clean_text(raw.get("node_id"), field="node_id", maximum=64, required=True)
     if not NODE_ID_RE.fullmatch(node_id):
         raise ValueError(f"node_id {node_id!r} is invalid")
@@ -452,7 +452,7 @@ def _canonical_plan(raw: Any) -> tuple[str, dict[str, Any]]:
     on schema, DAG, cap, or containment violations.
     """
     if not isinstance(raw, dict):
-        raise ValueError("plan must be a JSON object")
+        raise TypeError("plan must be a JSON object")
     if raw.get("schema") != PLAN_SCHEMA:
         raise ValueError(f"plan schema must be {PLAN_SCHEMA!r}")
 
