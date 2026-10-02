@@ -15,6 +15,7 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_HERMES_HOME = "/home/hermes/.hermes"
 EXPECTED_SERVER_HOME = "/opt/data"
+EXPECTED_RUNTIME_PYTHON = "/opt/hermes/.venv/bin/python"
 INFISICAL_HOME = "/home/hermes/.hermes/home"
 SERVER_URL = "http://127.0.0.1:17678/"
 SERVER_COMMAND = (
@@ -40,6 +41,8 @@ def _flag_enabled() -> bool:
 
 
 def _validate_runtime_paths() -> None:
+    if os.path.abspath(sys.executable) != os.path.abspath(EXPECTED_RUNTIME_PYTHON):
+        raise RuntimeError("gateway must use the Hermes Agent runtime Python environment")
     if os.getenv("HERMES_HOME") != EXPECTED_HERMES_HOME:
         raise RuntimeError("HERMES_HOME does not point at the shared Hermes state")
     if os.getenv("HOME") != EXPECTED_SERVER_HOME:

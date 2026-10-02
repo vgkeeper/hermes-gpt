@@ -27,6 +27,18 @@ def test_server_command_is_loopback_only_and_uses_checkout_source():
     assert command[2:] == ["--http", "--host", "127.0.0.1", "--port", "17678"]
 
 
+def test_runtime_guard_requires_shared_home_and_hermes_python(monkeypatch):
+    monkeypatch.setattr(gateway.sys, "executable", gateway.EXPECTED_RUNTIME_PYTHON)
+    monkeypatch.setenv("HERMES_HOME", gateway.EXPECTED_HERMES_HOME)
+    monkeypatch.setenv("HOME", gateway.EXPECTED_SERVER_HOME)
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    gateway._validate_runtime_paths()
+
+    monkeypatch.setattr(gateway.sys, "executable", str(ROOT / ".venv/bin/python"))
+    with pytest.raises(RuntimeError, match="Agent runtime Python"):
+        gateway._validate_runtime_paths()
+
+
 def test_server_environment_drops_tunnel_and_provider_secrets(monkeypatch):
     monkeypatch.setenv("HERMES_HOME", "/home/hermes/.hermes")
     monkeypatch.setenv("HERMES_PROFILE", "default")

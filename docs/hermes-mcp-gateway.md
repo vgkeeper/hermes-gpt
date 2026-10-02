@@ -28,6 +28,8 @@ The MCP server process uses the same `HOME`, `HERMES_HOME`, and `HERMES_PROFILE`
 
 ## Process and health behavior
 
+The gateway supervisor and MCP server must run under the Hermes Agent image's own Python environment, which includes the session-store dependencies used by the Hermes CLI. A development-only MCP virtualenv can answer `tools/list` yet fail session reads when a Hermes dependency such as `psutil` is absent. The source checkout is loaded through `PYTHONPATH`; the runtime interpreter remains the Hermes Agent venv.
+
 The gateway supervisor starts the MCP server on `127.0.0.1:17678`, waits for its root health endpoint, then starts the tunnel client. The client targets the same container's `/mcp` endpoint and exposes its readiness endpoint only on `127.0.0.1:17679`. Container health requires the MCP server to answer and, when tunnel mode is enabled, the tunnel client to report ready. Unexpected exit of either child stops the sibling so the container restart policy can recover the whole gateway consistently.
 
 The initial local-validation mode may leave the tunnel client disabled while the old tunnel remains connected. Enable the new tunnel client only after the isolated gateway passes same-state MCP checks; never connect two tunnel clients to the same tunnel ID simultaneously.
