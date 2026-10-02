@@ -96,7 +96,7 @@ def tunnel_command() -> list[str]:
         tunnel_id,
         "--health.listen-addr",
         "127.0.0.1:17679",
-        "--log-format",
+        "--log.format",
         "json",
     ]
 

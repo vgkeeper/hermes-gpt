@@ -86,6 +86,7 @@ def test_tunnel_command_uses_infisical_and_fixed_loopback_target(monkeypatch):
     assert command[command.index("--control-plane.base-url") + 1] == "https://api.openai.com"
     assert command[command.index("--mcp.server-url") + 1] == "url=http://127.0.0.1:17678/mcp,channel=main"
     assert command[command.index("--control-plane.tunnel-id") + 1] == tunnel_id
+    assert command[command.index("--log.format") + 1] == "json"
     assert "--api-key" not in command
     assert "CONTROL_PLANE_API_KEY" not in command
     assert "INFISICAL_TOKEN" in command
