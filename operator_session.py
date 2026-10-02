@@ -5,19 +5,25 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
+import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-import operator_policy as op
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback keeps legacy behavior
+    fcntl = None
 
+import operator_policy as op
 
 ENABLE_SESSION_CONTROL_ENV = "HERMES_GPT_ENABLE_SESSION_CONTROL"
 SESSION_CONTROL_SHARED_STATE_ENV = "HERMES_GPT_SESSION_CONTROL_SHARED_STATE"
@@ -104,6 +110,8 @@ def _bound_result_for_mcp(meta: dict[str, Any], response: str, budget: int) -> t
 _lock = threading.RLock()
 _processes: dict[str, subprocess.Popen[str]] = {}
 _active_sessions: dict[str, str] = {}
+_OWNER_INSTANCE_ID = uuid4().hex
+_LEASE_SECONDS = 12
 
 
 def _now() -> str:
@@ -146,7 +154,7 @@ def _redact(value: Any) -> Any:
 def _save(meta: dict[str, Any], hermes_root: Path | None = None) -> None:
     path, _ = _paths(meta["job_id"], hermes_root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(".tmp")
+    temp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     temp.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
     temp.replace(path)
 
@@ -165,6 +173,76 @@ def _load(job_id: str, hermes_root: Path | None = None) -> dict[str, Any] | None
 def _shared_state_enabled() -> bool:
     """Whether this runtime shares job files with a process in another PID namespace."""
     return op.env_truthy(SESSION_CONTROL_SHARED_STATE_ENV)
+
+
+def _session_lease_paths(session_id: str, profile: str, hermes_root: Path | None = None) -> tuple[Path, Path]:
+    key = hashlib.sha256(f"{profile}\0{session_id}".encode()).hexdigest()
+    root = _root(hermes_root) / "session-leases"
+    return root / f"{key}.lock", root / f"{key}.json"
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _try_session_lock(path: Path) -> tuple[bool, int | None]:
+    """Return (held-by-another-process, fd-if-acquired) using shared flock."""
+    if fcntl is None:
+        return False, None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return True, None
+    except OSError:
+        os.close(fd)
+        return False, None
+    return False, fd
+
+
+def _lease_state(meta: dict[str, Any], hermes_root: Path | None = None) -> tuple[str, dict[str, Any] | None]:
+    """Read lease freshness and lock ownership; never use a foreign PID as proof."""
+    token = meta.get("owner_token")
+    session_id = meta.get("session_id")
+    profile = str(meta.get("profile", "default") or "default")
+    if not isinstance(token, str) or not token or not isinstance(session_id, str) or fcntl is None:
+        return "none", None
+    lock_path, lease_path = _session_lease_paths(session_id, profile, hermes_root)
+    lease = _read_json(lease_path)
+    matching = bool(
+        lease
+        and lease.get("owner_token") == token
+        and lease.get("job_id") == meta.get("job_id")
+        and lease.get("session_id") == session_id
+        and lease.get("profile", "default") == profile
+    )
+    busy, fd = _try_session_lock(lock_path)
+    if fd is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    if busy:
+        if matching:
+            return "active", lease
+        # A locked session lease is positive evidence that an owner process is
+        # alive; a brief metadata/sidecar publication race is safe to preserve.
+        return ("active", lease) if lease is None else ("conflict", lease)
+    if not isinstance(lease, dict) or not matching:
+        return "expired", lease
+    try:
+        expiry = datetime.fromisoformat(str(lease.get("lease_expires_at", "")).replace("Z", "+00:00"))
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return "expired", lease
+    if expiry.timestamp() > datetime.now(timezone.utc).timestamp():
+        return "grace", lease
+    return "expired", lease
 
 
 def _job_runtime_limit(meta: dict[str, Any]) -> int:
@@ -188,9 +266,7 @@ def _job_age_seconds(meta: dict[str, Any]) -> float:
 
 
 def _foreign_active_job(session_id: str, profile: str, hermes_root: Path | None = None) -> str | None:
-    """Find a recent job in the shared store that this PID namespace cannot own."""
-    if not _shared_state_enabled():
-        return None
+    """Find an active or leased job for this session across all server runtimes."""
     root = _root(hermes_root)
     if not root.exists():
         return None
@@ -200,18 +276,33 @@ def _foreign_active_job(session_id: str, profile: str, hermes_root: Path | None 
         meta = _load(path.stem, hermes_root)
         if not meta or path.stem in owned:
             continue
-        if meta.get("status") not in {"starting", "running"}:
-            continue
         if meta.get("session_id") != session_id or (meta.get("profile", "default") or "default") != profile:
             continue
-        if _job_age_seconds(meta) < _job_runtime_limit(meta):
+        lease_status, _ = _lease_state(meta, hermes_root)
+        if lease_status in {"active", "grace"}:
+            return path.stem
+        if meta.get("status") in {"starting", "running"} and _job_age_seconds(meta) < _job_runtime_limit(meta):
             return path.stem
     return None
 
 
-def _job_view(meta: dict[str, Any]) -> dict[str, Any]:
+def _job_view(meta: dict[str, Any], hermes_root: Path | None = None) -> dict[str, Any]:
     """Annotate foreign running jobs without persisting PID-namespace guesses."""
     view = dict(meta)
+    for key in (
+        "owner_token",
+        "owner_instance_id",
+        "owner_container",
+        "owner_started_at",
+        "owner_pid_start_token",
+        "lease_expires_at",
+        "heartbeat_at",
+    ):
+        view.pop(key, None)
+    lease_status, _ = _lease_state(meta, hermes_root)
+    if lease_status in {"active", "grace"} and str(meta.get("job_id", "")) not in _processes:
+        view["process_visibility"] = "external_pid_namespace"
+        return view
     if not _shared_state_enabled() or view.get("status") not in {"starting", "running"}:
         return view
     with _lock:
@@ -254,7 +345,7 @@ def _validate_start(
         )
     try:
         safe_profile = op.validate_profile_name(profile)
-    except Exception:
+    except ValueError:
         return _error("INVALID_PROFILE", "profile is not a valid Hermes profile name.", "Use an authorized profile name.")
     return session_id.strip(), prompt, max(MIN_JOB_RUNTIME_SECONDS, min(max_job_runtime_seconds, MAX_JOB_RUNTIME_SECONDS)), safe_profile
 
@@ -290,17 +381,28 @@ def _start_job(
     :func:`hermes_session_create` (newly created session). The caller has
     already validated inputs and, for create, persisted the session.
     """
-    if _shared_state_enabled():
-        # A sibling server has a different PID namespace. Keep its recent jobs
-        # visible and refuse a parallel turn instead of falsely orphaning it.
-        _reconcile(hermes_root)
-        foreign_job = _foreign_active_job(safe_id, safe_profile, hermes_root)
-        if foreign_job:
-            return _error(
-                "SESSION_BUSY",
-                "This Hermes session already has a running session-control job in shared state.",
-                f"Wait for job {foreign_job} to reach a terminal state before sending another turn.",
-            )
+    _reconcile(hermes_root)
+    foreign_job = _foreign_active_job(safe_id, safe_profile, hermes_root)
+    if foreign_job:
+        return _error(
+            "SESSION_BUSY",
+            "This Hermes session already has a running session-control job in shared state.",
+            f"Wait for job {foreign_job} to reach a terminal state before sending another turn.",
+        )
+    if fcntl is None:
+        return _error(
+            "SESSION_LEASE_UNAVAILABLE",
+            "Cross-process session ownership requires shared filesystem locks.",
+            "Use a POSIX runtime with a shared Hermes data directory.",
+        )
+    lock_path, lease_path = _session_lease_paths(safe_id, safe_profile, hermes_root)
+    busy, lease_fd = _try_session_lock(lock_path)
+    if busy or lease_fd is None:
+        return _error(
+            "SESSION_BUSY",
+            "This Hermes session already has a running session-control job.",
+            "Wait for its shared owner lease to be released before continuing.",
+        )
     argv = [_hermes_executable(agent_root), "--resume", safe_id, "--oneshot", safe_prompt]
     active_key = f"{safe_profile}:{safe_id}"
     job_id = uuid4().hex
@@ -318,21 +420,29 @@ def _start_job(
         "prompt_len": len(safe_prompt),
         "prompt_sha256": hashlib.sha256(safe_prompt.encode("utf-8")).hexdigest(),
         "max_job_runtime_seconds": safe_timeout,
+        "owner_token": uuid4().hex,
+        "owner_instance_id": _OWNER_INSTANCE_ID,
+        "owner_container": os.environ.get("HOSTNAME", "unknown")[:128],
+        "heartbeat_at": _now(),
+        "lease_expires_at": (datetime.now(timezone.utc) + timedelta(seconds=_LEASE_SECONDS)).isoformat(),
     }
-    _, output_path = _paths(job_id, hermes_root)
+    metadata_path, output_path = _paths(job_id, hermes_root)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output = open(output_path, "w", encoding="utf-8")
+    output = output_path.open("w", encoding="utf-8")
     with _lock:
         active_job = _active_sessions.get(active_key)
         if active_job:
             output.close()
             output_path.unlink(missing_ok=True)
+            fcntl.flock(lease_fd, fcntl.LOCK_UN)
+            os.close(lease_fd)
             return _error(
                 "SESSION_BUSY",
                 "This Hermes session already has a running session-control job.",
                 f"Wait for job {active_job} to finish before sending another turn.",
             )
         _active_sessions[active_key] = job_id
+    _save(meta, hermes_root)
     child_env = os.environ.copy()
     base_home = (
         Path(hermes_root)
@@ -343,29 +453,71 @@ def _start_job(
     child_env["HERMES_HOME"] = str(profile_home)
     child_env["HERMES_PROFILE"] = safe_profile
     try:
+        worker_path = Path(__file__).with_name("operator_session_worker.py")
+        worker_argv = [sys.executable, str(worker_path), "--lease-fd", str(lease_fd)]
+        worker_config = {
+            "job_id": job_id,
+            "session_id": safe_id,
+            "profile": safe_profile,
+            "owner_token": meta["owner_token"],
+            "owner_instance_id": _OWNER_INSTANCE_ID,
+            "owner_container": meta["owner_container"],
+            "metadata_path": str(metadata_path),
+            "output_path": str(output_path),
+            "lease_path": str(lease_path),
+            "timeout": safe_timeout,
+            "command": argv,
+        }
+        popen_options: dict[str, Any] = {
+            "stdin": subprocess.PIPE,
+            "stdout": output,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+            "shell": False,
+            "env": child_env,
+            "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+            "start_new_session": os.name != "nt",
+        }
+        if os.name == "posix":
+            popen_options["pass_fds"] = (lease_fd,)
         proc = subprocess.Popen(
-            argv,
-            stdout=output,
-            stderr=subprocess.STDOUT,
-            text=True,
-            shell=False,
-            env=child_env,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
-            start_new_session=os.name != "nt",
+            worker_argv,
+            **popen_options,
         )
+        if proc.stdin is not None:
+            proc.stdin.write(json.dumps(worker_config))
+            proc.stdin.close()
+        os.close(lease_fd)
+        lease_fd = -1
     except (OSError, ValueError) as exc:
+        proc = locals().get("proc")
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    proc.kill()
+                    proc.wait(timeout=3)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
         output.close()
-        output_path.unlink(missing_ok=True)
+        try:
+            if lease_fd >= 0:
+                fcntl.flock(lease_fd, fcntl.LOCK_UN)
+                os.close(lease_fd)
+        except OSError:
+            pass
         with _lock:
             if _active_sessions.get(active_key) == job_id:
                 _active_sessions.pop(active_key, None)
+        meta.update({"status": "failed", "return_code": None, "ended_at": _now()})
+        _save(meta, hermes_root)
         return _error(
             "HERMES_START_FAILED",
             op.redact_output(str(exc)),
             "Check the Hermes CLI installation, provider authentication, and session ID.",
         )
-    meta.update({"status": "running", "started_at": _now(), "pid": proc.pid})
-    _save(meta, hermes_root)
     with _lock:
         _processes[job_id] = proc
     threading.Thread(
@@ -410,7 +562,7 @@ def _validate_create(
         )
     try:
         safe_profile = op.validate_profile_name(profile)
-    except Exception:
+    except ValueError:
         return _error("INVALID_PROFILE", "profile is not a valid Hermes profile name.", "Use an authorized profile name.")
     safe_title = None
     if title is not None:
@@ -429,7 +581,7 @@ def _validate_create(
 
 def _new_session_id() -> str:
     """Return a fresh session id in the CLI's ``{YYYYmmdd_HHMMSS}_{uuid6}`` shape."""
-    return f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:6]}"
+    return f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:6]}"
 
 
 def _create_session_in_db(
@@ -484,7 +636,7 @@ def hermes_session_create(
                 "The new Hermes session could not be persisted.",
                 "Check the Hermes session database and profile.",
             )
-    except Exception as exc:
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
         return _error(
             "SESSION_CREATE_FAILED",
             op.redact_output(str(exc)),
@@ -495,11 +647,13 @@ def hermes_session_create(
 
 def _watch(job_id: str, proc: subprocess.Popen[str], output: Any, timeout: int, hermes_root: Path | None) -> None:
     try:
-        proc.wait(timeout=timeout)
-        status = "completed" if proc.returncode == 0 else "failed"
+        # The independent worker enforces the actual deadline and publishes the
+        # terminal record. This margin lets it perform that write before we reap it.
+        proc.wait(timeout=timeout + 15)
+        fallback_status = "completed" if proc.returncode == 0 else "failed"
     except subprocess.TimeoutExpired:
         _terminate(proc)
-        status = "timed_out"
+        fallback_status = "timed_out"
     finally:
         output.close()
     with _lock:
@@ -511,8 +665,9 @@ def _watch(job_id: str, proc: subprocess.Popen[str], output: Any, timeout: int, 
     with _lock:
         if _active_sessions.get(active_key) == job_id:
             _active_sessions.pop(active_key, None)
-    meta.update({"status": status, "return_code": proc.poll(), "ended_at": _now()})
-    _save(meta, hermes_root)
+    if meta.get("status") not in _SESSION_TERMINAL_STATES:
+        meta.update({"status": fallback_status, "return_code": proc.poll(), "ended_at": _now()})
+        _save(meta, hermes_root)
 
 
 def _terminate(proc: subprocess.Popen[str]) -> None:
@@ -523,8 +678,11 @@ def _terminate(proc: subprocess.Popen[str]) -> None:
         else:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             proc.wait(timeout=3)
-    except Exception:
-        proc.kill()
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 def _reconcile(hermes_root: Path | None = None) -> None:
@@ -532,7 +690,7 @@ def _reconcile(hermes_root: Path | None = None) -> None:
     if not root.exists():
         return
     with _lock:
-        owned = set(_processes)
+        owned = dict(_processes)
     shared_state = _shared_state_enabled()
     for path in root.glob("*.json"):
         try:
@@ -540,14 +698,46 @@ def _reconcile(hermes_root: Path | None = None) -> None:
         except (OSError, ValueError):
             continue
         job_id = str(meta.get("job_id", path.stem))
-        active_state = meta.get("status") in ({"starting", "running"} if shared_state else {"running"})
-        if not active_state or job_id in owned:
+        status = str(meta.get("status", ""))
+        lease_state, lease = _lease_state(meta, hermes_root)
+        if lease_state in {"active", "grace"} and status in {"starting", "running", "orphaned"}:
+            # Recover legacy false-orphan writes when the durable owner lease is
+            # still valid. The lock proves liveness across PID namespaces.
+            owner_status = str((lease or {}).get("state", "running"))
+            if lease is None and status == "starting":
+                owner_status = "starting"
+            elif owner_status not in {"starting", "running"} or status == "running":
+                owner_status = "running"
+            if status != owner_status or "reconciliation" in meta or "ended_at" in meta:
+                meta.update({"status": owner_status, "ended_at": None})
+                meta.pop("reconciliation", None)
+                _save(meta, hermes_root)
             continue
-        if shared_state and _job_age_seconds(meta) < _job_runtime_limit(meta):
-            # PID values are namespace-local. A sibling container may still own
-            # this live job, so preserve it until its recorded timeout elapses.
+        proc = owned.get(job_id)
+        if proc is not None and proc.poll() is None:
             continue
-        if shared_state:
+        if proc is not None:
+            with _lock:
+                _processes.pop(job_id, None)
+        if status in _SESSION_TERMINAL_STATES:
+            continue
+        has_lease = bool(meta.get("owner_token"))
+        active_state = status in ({"starting", "running"} if shared_state else {"running"})
+        if has_lease and status == "starting":
+            active_state = True
+        if not active_state:
+            continue
+        if has_lease and lease_state == "expired":
+            meta.update({
+                "status": "orphaned",
+                "ended_at": _now(),
+                "reconciliation": "owner lease expired and no live session lock could be proven",
+            })
+        elif shared_state and _job_age_seconds(meta) < _job_runtime_limit(meta):
+            # Legacy foreign jobs have no durable lease; preserve them until the
+            # configured limit instead of interpreting their PID cross-namespace.
+            continue
+        elif shared_state:
             meta.update({
                 "status": "timed_out",
                 "ended_at": _now(),
@@ -567,7 +757,7 @@ def hermes_session_job_status(job_id: str, hermes_root: Path | None = None) -> d
     meta = _load(job_id, hermes_root)
     if not meta:
         return _error("JOB_NOT_FOUND", "Hermes session job was not found.", "Check the job ID returned by hermes_session_continue.")
-    return _redact({"success": True, "job": _job_view(meta)})
+    return _redact({"success": True, "job": _job_view(meta, hermes_root)})
 
 
 def _load_result_text(job_id: str, hermes_root: Path | None) -> str:
@@ -601,7 +791,7 @@ def hermes_session_job_result(job_id: str, max_chars: int = MAX_RESULT_CHARS, he
         "status": meta.get("status"),
         "return_code": meta.get("return_code"),
     }
-    visibility = _job_view(meta).get("process_visibility")
+    visibility = _job_view(meta, hermes_root).get("process_visibility")
     if visibility:
         include["process_visibility"] = visibility
     char_limited = len(text) > cap
@@ -654,7 +844,7 @@ def hermes_session_job_result_page(
         "status": meta.get("status"),
         "return_code": meta.get("return_code"),
     }
-    visibility = _job_view(meta).get("process_visibility")
+    visibility = _job_view(meta, hermes_root).get("process_visibility")
     if visibility:
         include["process_visibility"] = visibility
     want = min(max_bytes, max(budget - _MCP_OVERHEAD - 4096, 64))

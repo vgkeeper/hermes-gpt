@@ -1,5 +1,8 @@
 import json
+import os
 import subprocess
+import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -16,10 +19,25 @@ class _ImmediateThread:
         self.target(*self.args)
 
 
+class _FakeInput:
+    def __init__(self):
+        self.parts = []
+
+    def write(self, value):
+        self.parts.append(value)
+
+    def close(self):
+        pass
+
+    def getvalue(self):
+        return "".join(self.parts)
+
+
 class _FakeProcess:
     def __init__(self, argv, **kwargs):
         self.argv = argv
         self.kwargs = kwargs
+        self.stdin = _FakeInput()
         self.pid = 4321
         self.returncode = None
 
@@ -62,8 +80,10 @@ def test_mocked_continue_status_and_result(monkeypatch, tmp_path):
     )
     assert started["success"] is True
     assert len(calls) == 1
-    assert Path(calls[0].argv[0]).name.lower() in {"hermes", "hermes.exe"}
-    assert calls[0].argv[1:] == ["--resume", "20260810_143227_6b0982", "--oneshot", prompt]
+    assert Path(calls[0].argv[1]).name == "operator_session_worker.py"
+    worker_config = json.loads(calls[0].stdin.getvalue())
+    assert Path(worker_config["command"][0]).name.lower() in {"hermes", "hermes.exe"}
+    assert worker_config["command"][1:] == ["--resume", "20260810_143227_6b0982", "--oneshot", prompt]
     assert calls[0].kwargs["shell"] is False
     assert calls[0].kwargs["env"]["HERMES_PROFILE"] == "project-manager"
     assert calls[0].kwargs["env"]["HERMES_HOME"] == str(tmp_path / "profiles" / "project-manager")
@@ -354,9 +374,9 @@ def test_session_create_builds_new_distinct_session(monkeypatch, tmp_path):
     assert _re.fullmatch(r"\d{8}_\d{6}_[0-9a-f]{6}", new_sid)
     # title recorded
     assert fake_db.titled == [(new_sid, "My fresh session")]
-    # CLI resumed the newly created session for the first work
-    assert len(calls) == 1
-    assert calls[0].argv[1:] == ["--resume", new_sid, "--oneshot", prompt]
+    # The durable worker keeps the Hermes CLI argv in its private stdin payload.
+    worker_config = json.loads(calls[0].stdin.getvalue())
+    assert worker_config["command"][1:] == ["--resume", new_sid, "--oneshot", prompt]
 
     # job tracked to completion and readable by wait/result
     waited = session.hermes_session_job_wait(started["job_id"], 5, tmp_path)
@@ -374,3 +394,222 @@ def test_session_create_does_not_accept_arbitrary_profile(monkeypatch, tmp_path)
         "p", profile="../../etc/passwd", hermes_root=tmp_path
     )
     assert result["code"] == "INVALID_PROFILE"
+
+
+def _lease_record(job_id, session_id, token, *, expiry, state="running"):
+    return {
+        "schema_version": 1,
+        "job_id": job_id,
+        "session_id": session_id,
+        "profile": "default",
+        "owner_token": token,
+        "owner_instance_id": "test-owner",
+        "owner_container": "test-gateway",
+        "owner_pid": 999999,
+        "state": state,
+        "heartbeat_at": session._now(),
+        "lease_expires_at": expiry,
+    }
+
+
+def test_live_shared_lease_recovers_legacy_orphan_without_pid_visibility(monkeypatch, tmp_path):
+    monkeypatch.delenv(session.SESSION_CONTROL_SHARED_STATE_ENV, raising=False)
+    job_id, session_id, token = "f" * 32, "namespace-session", "owner-token"
+    lock_path, lease_path = session._session_lease_paths(session_id, "default", tmp_path)
+    busy, lock_fd = session._try_session_lock(lock_path)
+    assert not busy and lock_fd is not None
+    expiry = (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease_path.write_text(json.dumps(_lease_record(job_id, session_id, token, expiry=expiry)), encoding="utf-8")
+    session._save(
+        {
+            "job_id": job_id,
+            "session_id": session_id,
+            "profile": "default",
+            "status": "orphaned",
+            "owner_token": token,
+            "pid": 999999,
+            "reconciliation": "server restarted; process ownership could not be proven",
+        },
+        tmp_path,
+    )
+    try:
+        status = session.hermes_session_job_status(job_id, tmp_path)
+        result = session.hermes_session_job_result(job_id, hermes_root=tmp_path)
+        assert status["job"]["status"] == "running"
+        assert status["job"]["process_visibility"] == "external_pid_namespace"
+        assert result["status"] == "running"
+        assert "owner-token" not in json.dumps(status)
+        persisted = session._load(job_id, tmp_path)
+        assert persisted["status"] == "running"
+        assert "reconciliation" not in persisted
+    finally:
+        session.fcntl.flock(lock_fd, session.fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def test_expired_lease_is_preserved_during_grace_then_orphaned(monkeypatch, tmp_path):
+    monkeypatch.delenv(session.SESSION_CONTROL_SHARED_STATE_ENV, raising=False)
+    job_id, session_id, token = "e" * 32, "lease-grace-session", "grace-owner"
+    _, lease_path = session._session_lease_paths(session_id, "default", tmp_path)
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    future = (datetime.now(timezone.utc) + timedelta(seconds=20)).isoformat()
+    lease_path.write_text(json.dumps(_lease_record(job_id, session_id, token, expiry=future)), encoding="utf-8")
+    session._save(
+        {"job_id": job_id, "session_id": session_id, "profile": "default", "status": "running", "owner_token": token},
+        tmp_path,
+    )
+    assert session.hermes_session_job_status(job_id, tmp_path)["job"]["status"] == "running"
+
+    expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    lease_path.write_text(json.dumps(_lease_record(job_id, session_id, token, expiry=expired)), encoding="utf-8")
+    status = session.hermes_session_job_status(job_id, tmp_path)
+    assert status["job"]["status"] == "orphaned"
+    assert "lease expired" in status["job"]["reconciliation"]
+
+
+def _fake_hermes_executable(tmp_path, delay=1.5, name="hermes-fake"):
+    executable = tmp_path / name
+    executable.write_text(
+        "#!/usr/bin/env python3\nimport time\ntime.sleep(" + repr(delay) + ")\nprint('MCP_GATEWAY_E2E_OK')\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    return executable
+
+
+def _second_runtime_read(job_id, root):
+    script = (
+        "import json,os,sys; import operator_session as s; from pathlib import Path; "
+        "os.kill=lambda *_args: (_ for _ in ()).throw(ProcessLookupError('isolated PID namespace')); "
+        "r=Path(sys.argv[2]); a=s.hermes_session_job_status(sys.argv[1],r); "
+        "b=s.hermes_session_job_result(sys.argv[1],hermes_root=r); "
+        "print(json.dumps({'status':a.get('job',{}).get('status'),"
+        "'visibility':a.get('job',{}).get('process_visibility'),"
+        "'result_status':b.get('status'),'response':b.get('response')}))"
+    )
+    env = os.environ.copy()
+    env["HERMES_GPT_SESSION_CONTROL_SHARED_STATE"] = "0"
+    env["PYTHONPATH"] = str(Path(session.__file__).resolve().parent)
+    completed = subprocess.run(
+        [sys.executable, "-c", script, job_id, str(root)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+        env=env,
+    )
+    return json.loads(completed.stdout)
+
+
+def _second_runtime_continue(session_id, prompt, root, executable_dir):
+    script = (
+        "import json,sys; from pathlib import Path; import operator_session as s; "
+        "print(json.dumps(s.hermes_session_continue(sys.argv[1],sys.argv[2],"
+        "max_job_runtime_seconds=20,hermes_root=Path(sys.argv[3]))))"
+    )
+    env = os.environ.copy()
+    env["HERMES_GPT_ENABLE_SESSION_CONTROL"] = "1"
+    env["HERMES_GPT_SESSION_CONTROL_SHARED_STATE"] = "0"
+    env["HERMES_HOME"] = str(root)
+    env["PYTHONPATH"] = str(Path(session.__file__).resolve().parent)
+    env["PATH"] = str(executable_dir) + os.pathsep + env.get("PATH", "")
+    completed = subprocess.run(
+        [sys.executable, "-c", script, session_id, prompt, str(root)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+        env=env,
+    )
+    return json.loads(completed.stdout)
+
+
+def test_detached_worker_survives_parent_handle_loss_and_two_runtime_reads(monkeypatch, tmp_path):
+    monkeypatch.setenv(session.ENABLE_SESSION_CONTROL_ENV, "1")
+    monkeypatch.delenv(session.SESSION_CONTROL_SHARED_STATE_ENV, raising=False)
+    executable_dir = tmp_path / "bin"
+    executable_dir.mkdir()
+    _fake_hermes_executable(executable_dir, delay=3.0, name="hermes")
+    manager_script = (
+        "import json,operator_session as s; "
+        "print(json.dumps(s.hermes_session_continue('namespace-e2e-session','safe test',"
+        "max_job_runtime_seconds=20)),flush=True)"
+    )
+    env = os.environ.copy()
+    env["HERMES_GPT_ENABLE_SESSION_CONTROL"] = "1"
+    env["HERMES_GPT_SESSION_CONTROL_SHARED_STATE"] = "0"
+    env["HERMES_HOME"] = str(tmp_path)
+    env["PYTHONPATH"] = str(Path(session.__file__).resolve().parent)
+    env["PATH"] = str(executable_dir) + os.pathsep + env.get("PATH", "")
+    manager = subprocess.run(
+        [sys.executable, "-c", manager_script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+        env=env,
+    )
+    started = json.loads(manager.stdout)
+    assert started["success"] is True
+    job_id = started["job_id"]
+
+    # The MCP-like parent process has exited; only the detached lease owner remains.
+    observed = ""
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        observed = session.hermes_session_job_status(job_id, tmp_path)["job"]["status"]
+        if observed == "running":
+            break
+        time.sleep(0.05)
+    assert observed == "running"
+    owner = session._load(job_id, tmp_path)
+    assert owner is not None
+    assert owner.get("owner_token")
+    assert owner.get("owner_instance_id")
+    assert owner.get("owner_container")
+    assert owner.get("owner_pid_start_token")
+    assert owner.get("heartbeat_at")
+    assert owner.get("lease_expires_at")
+    foreign = {}
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        foreign = _second_runtime_read(job_id, tmp_path)
+        if foreign["status"] == "running" and foreign["result_status"] == "running":
+            break
+        time.sleep(0.05)
+    assert foreign["status"] == "running"
+    assert foreign["result_status"] == "running"
+    assert foreign["visibility"] == "external_pid_namespace"
+
+    waited = session.hermes_session_job_wait(job_id, wait_seconds=8, hermes_root=tmp_path)
+    assert waited["status"] == "completed"
+    result = session.hermes_session_job_result(job_id, hermes_root=tmp_path)
+    assert result["response"].strip() == "MCP_GATEWAY_E2E_OK"
+    terminal_from_second = _second_runtime_read(job_id, tmp_path)
+    assert terminal_from_second["status"] == "completed"
+    assert terminal_from_second["result_status"] == "completed"
+    assert terminal_from_second["response"].strip() == "MCP_GATEWAY_E2E_OK"
+
+
+def test_shared_file_lock_allows_only_one_concurrent_continue(monkeypatch, tmp_path):
+    monkeypatch.setenv(session.ENABLE_SESSION_CONTROL_ENV, "1")
+    monkeypatch.delenv(session.SESSION_CONTROL_SHARED_STATE_ENV, raising=False)
+    executable_dir = tmp_path / "bin"
+    executable_dir.mkdir()
+    fake_hermes = _fake_hermes_executable(executable_dir, delay=1.5, name="hermes")
+    monkeypatch.setattr(session, "_hermes_executable", lambda _root=None: str(fake_hermes))
+    first = session.hermes_session_continue(
+        "one-owner-session", "first safe turn", max_job_runtime_seconds=20, hermes_root=tmp_path
+    )
+    assert first["success"] is True
+    second = _second_runtime_continue("one-owner-session", "second safe turn", tmp_path, executable_dir)
+    assert second["success"] is False
+    assert second["code"] == "SESSION_BUSY"
+    files = [
+        session._load(path.stem, tmp_path)
+        for path in session._root(tmp_path).glob("*.json")
+        if (session._load(path.stem, tmp_path) or {}).get("session_id") == "one-owner-session"
+    ]
+    assert len(files) == 1
+    assert session.hermes_session_job_wait(first["job_id"], wait_seconds=8, hermes_root=tmp_path)["status"] == "completed"
