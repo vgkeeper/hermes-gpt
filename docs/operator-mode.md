@@ -203,19 +203,22 @@ Live events are notifications, not proof. Mission, Swarm, Work Contract, runner,
 
 ## OpenAI MCP Events extension (draft, experimental)
 
-This protocol-level extension is separate from the durable v0.9
-`hermes_live_events_*` stream above. On SDK 2.x Streamable HTTP it advertises
-`server/discover` and `events/list` and implements the draft subscription
-lifecycle, but currently exposes only the test event `hermes.test`. Its local
-`emit_test` helper is intentionally not an MCP tool or HTTP route; no Mission,
-session, or job lifecycle events are emitted by this prototype.
+The SDK 2.x Streamable HTTP extension advertises `server/discover`,
+`events/list`, `events/subscribe`, and `events/unsubscribe`. Its sole event,
+`hermes.live_event`, projects wake-up notifications from the durable
+`hermes_live_events_*` journal above. Notifications are not proof of completion;
+consumers must re-read authoritative state and validate the Work Contract.
 
-Event RPCs use the existing authenticated `/mcp` boundary and do not grant
-Operator or Owner authority. Callback signing secrets are stored in the
-`HERMES_HOME` event database; delivery uses bounded in-process retries without
-a durable outbox. Treat this as an experimental integration test, not as a
-production notification or delivery guarantee. See
-[MCP compatibility](mcp-compatibility.md#openai-mcp-events-extension).
+Live Events is the only durable business-event journal. The adapter's
+`mcp-events/subscriptions.sqlite3` stores subscription state, including callback
+credentials, cursors, leases, and callback-verification state; it is not a
+second event or delivery journal. Projection checkpoints its cursor after
+callback acceptance, uses bounded at-least-once delivery with stable message
+IDs, and never republishes callback responses into Live Events. Event RPCs use
+the existing authenticated `/mcp` boundary and grant no Operator or Owner
+authority. See [MCP compatibility](mcp-compatibility.md#openai-mcp-events-extension)
+for the canonical protocol, cursor, retention, callback-security, and SDK-version
+details.
 
 ## Binary file export
 
