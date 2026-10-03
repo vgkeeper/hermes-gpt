@@ -212,6 +212,11 @@ def test_session_tools_have_explicit_safety_annotations(monkeypatch):
 
     tools = tools_by_name(server.build_server())
 
+    def annotation_value(annotations, snake_name, camel_name):
+        if hasattr(annotations, snake_name):
+            return getattr(annotations, snake_name)
+        return getattr(annotations, camel_name)
+
     for name in [
         "hermes_session_search",
         "hermes_session_list",
@@ -225,9 +230,9 @@ def test_session_tools_have_explicit_safety_annotations(monkeypatch):
     ]:
         annotations = tools[name].annotations
         assert annotations is not None
-        assert annotations.read_only_hint is True
-        assert annotations.destructive_hint is False
-        assert annotations.open_world_hint is False
+        assert annotation_value(annotations, "read_only_hint", "readOnlyHint") is True
+        assert annotation_value(annotations, "destructive_hint", "destructiveHint") is False
+        assert annotation_value(annotations, "open_world_hint", "openWorldHint") is False
 
     for name in [
         "hermes_session_continue",
@@ -237,10 +242,10 @@ def test_session_tools_have_explicit_safety_annotations(monkeypatch):
     ]:
         annotations = tools[name].annotations
         assert annotations is not None
-        assert annotations.read_only_hint is False
-        assert annotations.destructive_hint is False
-        assert annotations.open_world_hint is False
-        assert annotations.idempotent_hint is False
+        assert annotation_value(annotations, "read_only_hint", "readOnlyHint") is False
+        assert annotation_value(annotations, "destructive_hint", "destructiveHint") is False
+        assert annotation_value(annotations, "open_world_hint", "openWorldHint") is False
+        assert annotation_value(annotations, "idempotent_hint", "idempotentHint") is False
 
 
 def test_memory_write_actions_are_disabled_by_default(monkeypatch):
