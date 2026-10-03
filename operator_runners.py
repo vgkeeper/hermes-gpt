@@ -510,7 +510,7 @@ def load_entrypoint_backends() -> list[str]:
     except Exception as exc:
         logger.debug("runner entry-point discovery failed", exc_info=exc)
         return loaded
-    builtin_names = {"fleet", "pi_rpc", "omx", "opencode", "codex"}
+    builtin_names = {"fleet", "pi_rpc", "omx", "opencode", "codex", "openhands"}
     for ep in selected:
         try:
             candidate = ep.load()
@@ -1658,7 +1658,9 @@ def hermes_runner_cancel(task_id: str, backend: str = "", confirm: bool = False,
 
 
 def _register_builtins() -> None:
-    for backend in (FleetBackend(), PiRpcBackend(), OpenCodeBackend(), OmxBackend(), CodexBackend()):
+    from operator_openhands import OpenHandsBackend
+
+    for backend in (FleetBackend(), PiRpcBackend(), OpenCodeBackend(), OmxBackend(), CodexBackend(), OpenHandsBackend()):
         register_backend(backend, replace=True)
 
 

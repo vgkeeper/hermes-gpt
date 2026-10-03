@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -28,6 +29,8 @@ from starlette.routing import BaseRoute, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 import operator_policy as op
+
+_LOG = logging.getLogger(__name__)
 
 SCHEMA_VERSION = "0.9-live.1"
 EVENT_SCHEMA = "hermes.live-event/v1"
@@ -218,6 +221,12 @@ def publish_event(
         row = db.execute("SELECT * FROM live_events WHERE seq=?", (seq,)).fetchone()
     with _condition:
         _condition.notify_all()
+    try:
+        from operator_mcp_events import notify_projector
+
+        notify_projector(hermes_root)
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        _LOG.debug("MCP Events projector wake-up failed error=%s", type(exc).__name__)
     assert row is not None
     return _row_event(row)
 
@@ -273,12 +282,20 @@ def read_since(
     return events, max(next_cursor, min(int(high or 0), next_cursor))
 
 
-def high_watermark(hermes_root: Path | None = None) -> int:
+def cursor_bounds(hermes_root: Path | None = None) -> tuple[int, int]:
+    """Return the oldest retained sequence and high watermark without creating storage."""
     path = _db_path(hermes_root)
     if not path.is_file():
-        return 0
+        return 0, 0
     with _connect(path, write=False) as db:
-        return int(db.execute("SELECT COALESCE(MAX(seq),0) FROM live_events").fetchone()[0] or 0)
+        oldest, high = db.execute(
+            "SELECT COALESCE(MIN(seq),0), COALESCE(MAX(seq),0) FROM live_events"
+        ).fetchone()
+    return int(oldest or 0), int(high or 0)
+
+
+def high_watermark(hermes_root: Path | None = None) -> int:
+    return cursor_bounds(hermes_root)[1]
 
 
 def hermes_live_events_cursor(hermes_root: Path | None = None) -> str:

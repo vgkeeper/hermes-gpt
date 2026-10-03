@@ -1,11 +1,12 @@
 import asyncio
 import json
 import os
-import sqlite3
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -17,7 +18,6 @@ from starlette.testclient import TestClient
 import oauth_auth
 import server
 import versioning
-
 
 GATE_ENVS = [
     server.ENABLE_WRITE_ENV,
@@ -37,6 +37,7 @@ GATE_ENVS = [
     oauth_auth.OAUTH_SCOPE_ENV,
     server.TRUSTED_PROXY_IPS_ENV,
     server.ALLOWED_HOSTS_ENV,
+    server.op_autopilot.AUTOPILOT_ENV,
 ]
 
 
@@ -83,16 +84,29 @@ def test_build_server_extends_transport_allowlist_from_env(monkeypatch):
 
 def test_asgi_app_does_not_register_browser_ui_routes(monkeypatch):
     clear_gate_envs(monkeypatch)
-    monkeypatch.setenv("HERMES_GPT_UI_ENABLED", "1")
+    monkeypatch.delenv("HERMES_GPT_UI_ENABLED", raising=False)
 
     app = server.build_asgi_app(server.build_server(http=True), http=True)
-    # CORSMiddleware -> bearer middleware -> Starlette route table.
     routes = app.app.app.routes
     paths = {getattr(route, "path", "") for route in routes}
 
     assert not any(path == "/ui" or path.startswith("/api/") for path in paths)
     assert "/events/ws" in paths
     assert "/" in paths
+    assert isinstance(routes[-1], server.Mount)
+
+
+def test_asgi_app_registers_browser_ui_when_enabled(monkeypatch):
+    clear_gate_envs(monkeypatch)
+    monkeypatch.setenv("HERMES_GPT_UI_ENABLED", "1")
+
+    app = server.build_asgi_app(server.build_server(http=True), http=True)
+    routes = app.app.app.routes
+    paths = {getattr(route, "path", "") for route in routes}
+
+    assert "/ui" in paths
+    assert "/api/me" in paths
+    assert "/events/ws" in paths
     assert isinstance(routes[-1], server.Mount)
 
 
@@ -305,7 +319,6 @@ def test_web_extract_proxies_to_web_tool_when_enabled(monkeypatch):
     clear_gate_envs(monkeypatch)
     monkeypatch.setenv(server.ENABLE_WEB_ENV, "1")
     captured = {}
-    import asyncio
 
     async def fake_web_extract(**kwargs):
         captured.update(kwargs)
@@ -325,7 +338,6 @@ def test_vision_analyze_proxies_to_vision_tool_when_enabled(monkeypatch):
     clear_gate_envs(monkeypatch)
     monkeypatch.setenv(server.ENABLE_VISION_ENV, "1")
     captured = {}
-    import asyncio
 
     async def fake_vision(**kwargs):
         captured.update(kwargs)
@@ -349,7 +361,6 @@ def test_vision_analyze_defaults_prompt_when_question_empty(monkeypatch):
     clear_gate_envs(monkeypatch)
     monkeypatch.setenv(server.ENABLE_VISION_ENV, "1")
     captured = {}
-    import asyncio
 
     async def fake_vision(**kwargs):
         captured.update(kwargs)
@@ -613,11 +624,9 @@ class _Phase1FakeSessionDB:
 
     def export_session(self, value):
         self.calls.append(("export_session", value))
-        return None
 
     def export_session_lineage(self, value):
         self.calls.append(("export_session_lineage", value))
-        return None
 
 
 def _phase1_adapter_factory(fake_db):
@@ -682,12 +691,11 @@ def test_phase1_adapter_context_manager_disposes_on_success_and_exception():
     error_connection = _Phase1FakeConnection()
     error_db = _Phase1FakeSessionDB(error_connection)
     error_factory, _ = _phase1_adapter_factory(error_db)
-    with pytest.raises(RuntimeError, match="expected"):
-        with server.ReadOnlySessionAdapter(
-            db_factory=error_factory,
-            connection_type=_Phase1FakeConnection,
-        ):
-            raise RuntimeError("expected")
+    with pytest.raises(RuntimeError, match="expected"), server.ReadOnlySessionAdapter(
+        db_factory=error_factory,
+        connection_type=_Phase1FakeConnection,
+    ):
+        raise RuntimeError("expected")
     assert error_connection.close_calls == 1
 
 
@@ -1550,7 +1558,7 @@ def test_http_initialize_smoke(monkeypatch):
                 with urllib.request.urlopen(request, timeout=2) as response:
                     response_text = response.read().decode("utf-8")
                     break
-            except Exception as exc:
+            except (OSError, urllib.error.URLError) as exc:
                 last_error = exc
                 time.sleep(0.25)
         if response_text is None:
@@ -1646,7 +1654,7 @@ def test_v09_connector_surface_acceptance(monkeypatch):
     assert len(set(names)) == len(names), "duplicate tool registration"
 
     # serverInfo.version must track the checkout version, not the SDK version.
-    assert (built.version if hasattr(built, "version") else built._mcp_server.version) == versioning.VERSION == "0.12.0"
+    assert (built.version if hasattr(built, "version") else built._mcp_server.version) == versioning.VERSION == "0.13.0"
 
 
 def test_history_enabled_connector_surface_acceptance(monkeypatch):
@@ -1679,7 +1687,7 @@ def test_history_enabled_connector_surface_acceptance(monkeypatch):
         schema = enabled_by_name[name].model_dump(by_alias=True)["inputSchema"]
         assert schema["properties"]["profile"]["default"] == "default"
 
-    assert (enabled.version if hasattr(enabled, "version") else enabled._mcp_server.version) == versioning.VERSION == "0.12.0"
+    assert (enabled.version if hasattr(enabled, "version") else enabled._mcp_server.version) == versioning.VERSION == "0.13.0"
 
 def test_session_continue_schema_exposes_max_job_runtime(monkeypatch):
     clear_gate_envs(monkeypatch)
@@ -1701,3 +1709,29 @@ def test_session_continue_schema_exposes_max_job_runtime(monkeypatch):
     assert wait["default"] == 120
     assert "wait_seconds" not in props
     assert "max_job_runtime_seconds" not in by_name["hermes_session_job_wait"]["properties"]
+
+
+AUTOPILOT_TOOLS = {"hermes_autopilot_start", "hermes_autopilot_status", "hermes_autopilot_stop"}
+
+
+def test_autopilot_tools_register_only_behind_their_machine_gate(monkeypatch):
+    clear_gate_envs(monkeypatch)
+    monkeypatch.setenv(server.op_finance.ENABLE_FINANCE_ENV, "1")
+    monkeypatch.setenv("HERMES_HOME", str(Path(server.__file__).resolve().parent))
+
+    default_names = tool_names(server.build_server())
+    assert len(default_names) == V09_CONNECTOR_TOOL_COUNT  # unchanged while the gate is unset
+    assert not AUTOPILOT_TOOLS & set(default_names)
+
+    monkeypatch.setenv(server.op_autopilot.AUTOPILOT_ENV, "1")
+    armed = server.build_server()
+    armed_names = tool_names(armed)
+    assert set(armed_names) - set(default_names) == AUTOPILOT_TOOLS
+    assert set(default_names) - set(armed_names) == set()
+    assert len(armed_names) == len(set(armed_names)) == V09_CONNECTOR_TOOL_COUNT + len(AUTOPILOT_TOOLS)
+
+    # The start tool exposes the full limit set with its documented defaults.
+    schema = tools_by_name(armed)["hermes_autopilot_start"].model_dump(by_alias=True)["inputSchema"]["properties"]
+    assert schema["max_concurrency"]["default"] == 3 and schema["max_replans"]["default"] == 2
+    assert schema["max_attempts_per_node"]["default"] == 3 and schema["max_runtime_seconds"]["default"] == 86400
+    assert schema["dry_run"]["default"] is True and schema["confirm"]["default"] is False

@@ -7,9 +7,11 @@ import json
 import pytest
 from starlette.testclient import TestClient
 
+import operator_live_events as live
 import operator_mcp_events as ev
 
 SECRET = "whsec_" + base64.b64encode(b"s" * 32).decode()
+SECRET_ALT = "whsec_" + base64.b64encode(b"t" * 32).decode()
 
 
 def test_standard_webhooks_signature_exact_body():
@@ -30,22 +32,43 @@ def test_ssrf_rejects_non_public(monkeypatch):
     with pytest.raises(ValueError,match="address_not_public"): ev._resolve_public("attacker.example",443)
 
 
-def test_delivery_retry_reuses_id_and_refreshes_signature_time(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME",str(tmp_path))
-    monkeypatch.setattr(ev,"_resolve_public",lambda *a:["93.184.216.34"])
-    monkeypatch.setattr(ev.time,"sleep",lambda *_:None)
-    with ev._db() as db:
-        db.execute("INSERT INTO subscriptions(id,principal,name,arguments,url,secret,expires,active) VALUES(?,?,?,?,?,?,?,1)",("sub_retry","p",ev.EVENT_NAME,ev.canonical({"test_id":"r"}).decode(),"https://example.com/cb",SECRET,None))
-    attempts=[]
-    def respond(_url,body,headers):
-        attempts.append((json.loads(body),headers))
-        return (503,b"") if len(attempts)<2 else (200,b"")
-    monkeypatch.setattr(ev,"post_https",respond)
-    result=ev.emit_test("r","retry",retries=2)
-    assert result["accepted"]==1 and len(attempts)==2
-    assert attempts[0][0]["eventId"]==attempts[1][0]["eventId"]
-    assert attempts[0][1]["webhook-timestamp"] != attempts[1][1]["webhook-timestamp"]
-    assert attempts[0][1]["webhook-signature"] != attempts[1][1]["webhook-signature"]
+def test_projection_uses_event_id_for_webhook_and_retry_signature(tmp_path, monkeypatch):
+    root = tmp_path / "hermes"
+    monkeypatch.setattr(ev.time, "sleep", lambda *_: None)
+    with ev._db(root) as db:
+        db.execute(
+            "INSERT INTO subscriptions(id,principal,name,arguments,url,secret,expires,active,cursor) "
+            "VALUES(?,?,?,?,?,?,?,1,0)",
+            ("sub_retry", "p", ev.EVENT_NAME, ev.canonical({"topic": "test"}).decode(), "https://example.com/cb", SECRET, None),
+        )
+    live.publish_event(
+        topic="test", kind="job.completed", subject_type="job", subject_id="job-1",
+        source="test", payload={"status": "complete", "prompt": "hidden"}, hermes_root=root,
+    )
+    attempts = []
+
+    def respond(_url, body, headers):
+        attempts.append((json.loads(body), headers))
+        return (503, b"") if len(attempts) == 1 else (200, b"")
+
+    monkeypatch.setattr(ev, "post_https", respond)
+    result = ev._drain("sub_retry", root)
+    assert result["accepted"] == 1 and result["pending"] == 0 and len(attempts) == 2
+    assert len(attempts) == 2
+    for projected, headers in attempts:
+        assert projected["eventId"] == headers["webhook-id"]
+        body = ev.canonical(projected)
+        timestamp = int(headers["webhook-timestamp"])
+        assert headers["webhook-signature"] == ev.sign(SECRET, projected["eventId"], timestamp, body)
+    first_headers, second_headers = (attempt[1] for attempt in attempts)
+    assert first_headers["webhook-id"] == second_headers["webhook-id"]
+    assert first_headers["webhook-timestamp"] != second_headers["webhook-timestamp"]
+    assert first_headers["webhook-signature"] != second_headers["webhook-signature"]
+    assert {k:v for k,v in first_headers.items() if k not in {"webhook-timestamp", "webhook-signature"}} == \
+           {k:v for k,v in second_headers.items() if k not in {"webhook-timestamp", "webhook-signature"}}
+    assert attempts[0][0]["data"]["payload"]["prompt"] == "[REDACTED]"
+    assert ev._drain("sub_retry", root)["accepted"] == 0
+    assert len(attempts) == 2
 
 
 def test_callback_verification_success_and_failure(monkeypatch):
@@ -61,30 +84,95 @@ def test_callback_verification_success_and_failure(monkeypatch):
     monkeypatch.setattr(ev,"post_https",lambda *a:(200,b'{"challenge":"no"}'))
     with pytest.raises(ValueError,match="challenge_failed"): ev.verify_callback("https://public.example/cb",SECRET,"sub_abc")
 
+def test_subscription_cursor_is_bounded_and_retention_is_reported(monkeypatch):
+    monkeypatch.setattr(live, "cursor_bounds", lambda _root=None: (5, 9))
+    assert ev._subscription_cursor({}, None) == (9, False)
+    assert ev._subscription_cursor({"cursor": "0"}, None) == (4, True)
+    assert ev._subscription_cursor({"cursor": 9}, None) == (9, False)
+    assert ev._subscription_cursor({"cursor": 10}, None) is None
+    assert ev._subscription_cursor({"cursor": "not-a-cursor"}, None) is None
 
-def test_subscribe_persist_idempotence_unsubscribe_and_emission(tmp_path,monkeypatch):
+
+
+
+def test_subscribe_projects_live_event_cursor_and_deduplicates(tmp_path, monkeypatch):
     async def run():
-        monkeypatch.setenv("HERMES_HOME",str(tmp_path))
-        calls=[]
-        monkeypatch.setattr(ev,"verify_callback",lambda *a:calls.append(("verify",a)))
-        monkeypatch.setattr(ev,"_resolve_public",lambda *a:["93.184.216.34"])
-        monkeypatch.setattr(ev,"post_https",lambda url,body,headers:(calls.append(("deliver",json.loads(body),headers)) or (200,b"")))
-        principal="principal-hash"
-        params={"name":"hermes.test","arguments":{"test_id":"abc"},"delivery":{"mode":"webhook","url":"https://public.example/cb","secret":SECRET}}
-        one=await ev.dispatch({"id":1,"method":"events/subscribe","params":params},principal)
-        two=await ev.dispatch({"id":2,"method":"events/subscribe","params":params},principal)
-        assert one["result"]["id"]==two["result"]["id"]
+        root = tmp_path / "hermes"
+        calls = []
+        monkeypatch.setattr(ev, "verify_callback", lambda *args: calls.append(("verify", args)))
+        monkeypatch.setattr(ev, "_resolve_public", lambda *args: ["93.184.216.34"])
+        monkeypatch.setattr(ev, "start_projector", lambda *_: None)
+        monkeypatch.setattr(
+            ev,
+            "post_https",
+            lambda url, body, headers: (calls.append(("deliver", json.loads(body), headers)) or (200, b"")),
+        )
+        principal = "principal-hash"
+        params = {
+            "name": ev.EVENT_NAME,
+            "arguments": {"topic": "test"},
+            "cursor": "0",
+            "delivery": {"mode": "webhook", "url": "https://public.example/cb", "secret": SECRET},
+        }
+        one = await ev.dispatch({"id": 1, "method": "events/subscribe", "params": params}, principal, root)
+        params["delivery"]["secret"] = SECRET_ALT
+        changed_secret = await ev.dispatch(
+            {"id": 3, "method": "events/subscribe", "params": params}, principal, root
+        )
+        assert changed_secret["result"]["id"] == one["result"]["id"]
+        assert len([call for call in calls if call[0] == "verify"]) == 2
+        params["delivery"]["secret"] = SECRET
+
+        two = await ev.dispatch({"id": 2, "method": "events/subscribe", "params": params}, principal, root)
+        assert one["result"]["id"] == two["result"]["id"]
         assert one["result"]["refreshBefore"]
-        with ev._db() as db:
-            assert db.execute("select count(*) from subscriptions").fetchone()[0]==1
-        assert ev.emit_test("abc","hello")=={"matched":1,"accepted":1,"duplicate":0}
-        event_call=next(c for c in calls if c[0]=="deliver")
-        assert event_call[1]["data"]=={"test_id":"abc","message":"hello"}
-        assert event_call[2]["webhook-id"]==event_call[1]["eventId"]
-        assert ev.emit_test("abc","again",event_id=event_call[1]["eventId"])["duplicate"]==1
-        unsub=await ev.dispatch({"id":3,"method":"events/unsubscribe","params":{"name":"hermes.test","arguments":{"test_id":"abc"},"delivery":{"url":"https://public.example/cb"}}},principal)
-        assert unsub["result"]=={}
-        assert ev.emit_test("abc","after")["matched"]==0
+        assert one["result"]["cursor"] == "0"
+        with ev._db(root) as db:
+            assert db.execute("SELECT COUNT(*) FROM subscriptions").fetchone()[0] == 1
+
+        live.publish_event(
+            topic="test", kind="job.completed", subject_type="job", subject_id="job-1",
+            source="test", payload={"state": "done"}, hermes_root=root,
+        )
+        high_before = live.high_watermark(root)
+        projection = ev.project_pending(root)
+        assert projection["matched"] == projection["accepted"] == 1
+        event_call = next(call for call in calls if call[0] == "deliver")
+        assert event_call[1]["name"] == ev.EVENT_NAME
+        assert event_call[1]["data"]["event_id"]
+        assert event_call[1]["cursor"] == "1"
+        assert event_call[2]["webhook-id"] == event_call[1]["eventId"]
+        assert ev.project_pending(root)["accepted"] == 0
+        assert live.high_watermark(root) == high_before
+        assert len(live.read_since(0, hermes_root=root)[0]) == 1
+        fresh = await ev.dispatch(
+            {"id": 4, "method": "events/subscribe", "params": {
+                "name": ev.EVENT_NAME, "arguments": {"topic": "other"},
+                "delivery": {"mode": "webhook", "url": "https://public.example/cb", "secret": SECRET},
+            }},
+            principal,
+            root,
+        )
+        assert fresh["result"]["cursor"] == str(high_before)
+
+
+
+        unsub = await ev.dispatch(
+            {"id": 3, "method": "events/unsubscribe", "params": {
+                "name": ev.EVENT_NAME, "arguments": {"topic": "test"},
+                "delivery": {"url": "https://public.example/cb"},
+            }},
+            principal,
+            root,
+        )
+        assert unsub["result"] == {}
+        live.publish_event(
+            topic="test", kind="job.updated", subject_type="job", subject_id="job-1",
+            source="test", payload={"state": "running"}, hermes_root=root,
+        )
+        assert ev.project_pending(root)["accepted"] == 0
+        assert len([call for call in calls if call[0] == "deliver"]) == 1
+
     asyncio.run(run())
 
 
@@ -93,7 +181,7 @@ def test_events_rpc_and_modern_only_passthrough():
         result=await ev.dispatch({"id":1,"method":"server/discover","params":{}},"p")
         assert result["result"]["capabilities"]["events"]=={}
         listing=await ev.dispatch({"id":2,"method":"events/list","params":{}},"p")
-        assert listing["result"]["events"][0]["name"]=="hermes.test"
+        assert listing["result"]["events"][0]["name"]==ev.EVENT_NAME
         assert listing["result"]["events"][0]["delivery"]==["webhook"]
     asyncio.run(run())
 
@@ -119,7 +207,7 @@ def test_real_http_modern_events(monkeypatch, tmp_path):
         assert discover.status_code == 200, discover.text
         assert discover.json()["result"]["capabilities"]["events"] == {}
         listing = client.post("/mcp", headers=modern, json={"jsonrpc":"2.0","id":2,"method":"events/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}})
-        assert listing.json()["result"]["events"][0]["name"] == "hermes.test"
+        assert listing.json()["result"]["events"][0]["name"] == ev.EVENT_NAME
         tools = client.post("/mcp", headers={**modern,"MCP-Method":"tools/list"}, json={"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}})
         assert tools.status_code == 200
         assert tools.json()["result"]["tools"]

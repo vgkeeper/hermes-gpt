@@ -21,90 +21,57 @@ authority. See the [SDK migration guide](https://py.sdk.modelcontextprotocol.io/
 
 ### OpenAI MCP Events extension
 
-Hermes implements a minimal prototype of OpenAI's draft MCP Events extension
-for protocol `2026-07-28` alongside the core MCP transport. This extension is
-separate from core `subscriptions/listen`; it adds `server/discover` with
+Hermes implements the draft OpenAI MCP Events extension for protocol
+`2026-07-28` alongside core MCP. It adds `server/discover` with
 `capabilities.events`, `events/list`, `events/subscribe`, and
-`events/unsubscribe`, and uses verified Standard Webhooks callbacks. The source
-contract is [OpenAI MCP Events](https://developers.openai.com/plugins/build/mcp-events)
-and its linked [draft design sketch](https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md).
+`events/unsubscribe`, using verified Standard Webhooks callbacks. It is separate
+from core `subscriptions/listen`; see [OpenAI MCP Events](https://developers.openai.com/plugins/build/mcp-events)
+and its [draft design sketch](https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md).
 
-The prototype exposes only `hermes.test` (`test_id` filter and `test_id` /
-`message` payload), on the same authenticated `/mcp` endpoint, and only for
-SDK 2.x Streamable HTTP modern protocol requests. SDK 1.x, legacy initialize,
-stdio, SSE and existing `tools/*` remain on their existing paths. The modern
-custom discovery response advertises tools plus events; it does not provide
-resources/prompts discovery.
+The only advertised event is `hermes.live_event`, a wake-up projection of the
+Live Events journal. Optional filters are `mission_id`, `topic`, and `kind`;
+payloads contain event identity, cursor, bounded event metadata, and the
+redacted Live Events payload. A callback is a notification, not evidence that a
+Mission or job succeeded. Consumers must re-read authoritative durable state
+and validate its Work Contract before acting on a completion claim.
 
-The real-HTTP modern Events integration test runs on SDK 2.x. SDK 1.x rejects
-`MCP-Protocol-Version: 2026-07-28` in its transport before the Events middleware
-can intercept the request (its supported revisions stop at `2025-11-25`), so
-that one modern-protocol test explicitly skips on SDK 1.x. This does not claim
-SDK 1.x supports the modern protocol; the legacy initialize and `tools/list`
-compatibility test continues to run on both SDK families.
+Live Events is the only durable business event journal. The OpenAI Events
+adapter stores subscription credentials and bounded subscription state
+(cursor, truncation flag, lease, expiry, and callback-verification cache) in
+`${HERMES_HOME:-~/.hermes}/mcp-events/subscriptions.sqlite3`. It does not keep a
+second event or delivery journal, and callback responses are never republished
+into Live Events. Subscription state uses a 0700 directory and 0600 database
+where supported. The `whsec_` callback secret is retained for restart-safe
+projection, so protect the runtime home and backups. Default lifetime is 24
+hours; `ttlMs` is bounded to 60 seconds–30 days; `ttlMs: null` does not expire.
 
-The middleware buffers at most 256 KiB while identifying a request method.
-Larger requests are replayed to the core MCP transport unchanged; oversized
-draft Events requests are therefore unsupported, while ordinary large tool
-requests retain the existing transport path. This extension does not add
-Operator tools or change Operator authority.
+A new subscription starts at the current Live Events high watermark unless a
+cursor is supplied. Decimal string/integer cursors are bounded by the journal;
+re-subscribing to the same identity never moves its durable cursor backwards.
+If retention removed requested events, the returned `truncated` flag is set and
+projection resumes from the oldest retained event. The projector checkpoints
+after each successful callback. Delivery is at-least-once across a crash
+between callback acceptance and checkpoint; retries reuse a stable webhook
+message ID so receivers can deduplicate. Failed delivery leaves the cursor at
+the last accepted event and is retried with bounded backoff. The journal remains
+the source of truth; the cursor is projection state, not proof of completion.
 
-Subscriptions persist in `${HERMES_HOME:-~/.hermes}/mcp-events/subscriptions.sqlite3`
-(SQLite, directory mode 0700 and database mode 0600 where supported). Rows
-contain deterministic ID, hashed bearer principal, event arguments, callback
-URL, `whsec_` secret and expiration. The signing secret is stored as required
-for restart-safe delivery; protect the runtime home and backups accordingly.
-Default lifetime is 24 hours; supplied `ttlMs` is bounded to 60 seconds–30 days;
-`ttlMs: null` grants a non-expiring subscription. This non-replayable event
-returns `cursor: null`. Internal emission entry point is
-`operator_mcp_events.emit_test(test_id, message)`; it is intentionally not
-registered as a network MCP tool or route.
+The extension is intercepted only on the authenticated `/mcp` Streamable HTTP
+endpoint for SDK 2.x modern requests. SDK 1.x rejects
+`MCP-Protocol-Version: 2026-07-28` before middleware can intercept it, so the
+real-HTTP modern Events test explicitly skips on SDK 1.x. Legacy initialize and
+`tools/list` continue on both SDK 1.x and 2.x. Stdio, SSE, legacy protocol
+requests, and core tools pass through unchanged. The middleware bounds request
+inspection to 256 KiB and replays larger requests unchanged to core MCP;
+oversized draft Events requests are unsupported. The extension adds no
+Operator tools and does not alter authority gates.
 
-Outbound callback requests require HTTPS, resolve only globally-routable IPs,
-connect to the checked IP while retaining TLS hostname verification, and do
-not follow redirects. This prototype has bounded synchronous retries and no
-persistent delivery queue: failed callbacks can be lost after the emitter
-returns/process shutdown. It is suitable for an isolated ChatGPT Work test, not
-production delivery guarantees. Callback URLs must be publicly reachable HTTPS.
-
-The OpenAI guide provides the exact ChatGPT Work setup and lifecycle test:
-connect/scan the plugin, use a Work chat (web or desktop Cloud), request a
-subscription, confirm callback verification, call the internal emitter with a
-matching `test_id`, verify ChatGPT receives/responds, then stop monitoring and
-confirm unsubscribe. This remains an experimental, test-only event surface, not
-a production event source. Deployment status is environment-specific and is
-not implied by this source document; review the delivery and identity limits
-before relying on subscriptions.
-
-#### Staged ChatGPT Work test procedure
-
-1. Deploy only to an isolated HTTPS-reachable staging instance after review;
-   configure its existing MCP plugin connection and authentication. Keep the
-   callback URL public HTTPS; do not log request bodies or `delivery.secret`.
-2. In ChatGPT, connect/rescan the plugin so its tools and `hermes.test` appear.
-   Start a Work chat on the web, or choose Work + Cloud in the desktop app.
-3. Ask ChatGPT to monitor `hermes.test` with a unique `test_id` and state the
-   expected response. Confirm the server receives `events/subscribe`, answers
-   callback verification, and stores the subscription.
-4. On the staging server, with the same runtime `HERMES_HOME`, emit locally:
-   `python -c 'from operator_mcp_events import emit_test; print(emit_test("<test-id>", "MCP Events test wake-up"))'`
-   Replace `<test-id>` with the exact filter chosen in ChatGPT. This is an
-   in-process local API, not an HTTP endpoint or MCP tool.
-5. Confirm delivery receives 2xx and ChatGPT responds in the subscribed Work
-   chat according to the user instruction. Then ask ChatGPT to stop monitoring;
-   verify `events/unsubscribe` and confirm no later matching event is delivered.
-6. Remove the staging subscription/database when the experiment is complete;
-   do not copy the callback signing secret into logs or source control.
-
-OpenAI also recommends testing refresh after restart, expiry, duplicate
-subscription/delivery, invalid signatures, revoked access and filtered-out
-events. This prototype's test event does not support replay; deliveries use a
-bounded in-process retry loop without a persistent outbox, so a process stop
-can lose an event after it is emitted. The principal key is a one-way hash of
-the authenticated Authorization header (or one shared local anonymous
-principal when no auth is configured), not a stable account ID; OAuth credential
-rotation can therefore create a distinct subscription identity. This must be
-resolved before relying on long-lived account-scoped subscriptions.
+Outbound callbacks require HTTPS, resolve only globally routable IPs, connect
+to the checked IP while retaining TLS hostname verification, and do not follow
+redirects. Subscription identity is a one-way hash of the authenticated
+Authorization header (or a shared anonymous local principal when authentication
+is not configured); it is not a stable account identifier. Do not treat
+subscription identity or callbacks as authorization or completion evidence.
 
 
 The shared `mcp_compat.HermesMCP` adapter preserves explicit HTTP/SSE options:
