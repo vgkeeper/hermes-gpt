@@ -32,7 +32,7 @@ def test_ssrf_rejects_non_public(monkeypatch):
     with pytest.raises(ValueError,match="address_not_public"): ev._resolve_public("attacker.example",443)
 
 
-def test_projection_retries_with_stable_id_and_advances_cursor_once(tmp_path, monkeypatch):
+def test_projection_uses_event_id_for_webhook_and_retry_signature(tmp_path, monkeypatch):
     root = tmp_path / "hermes"
     monkeypatch.setattr(ev.time, "sleep", lambda *_: None)
     with ev._db(root) as db:
@@ -54,10 +54,18 @@ def test_projection_retries_with_stable_id_and_advances_cursor_once(tmp_path, mo
     monkeypatch.setattr(ev, "post_https", respond)
     result = ev._drain("sub_retry", root)
     assert result["accepted"] == 1 and result["pending"] == 0 and len(attempts) == 2
-    assert attempts[0][0]["eventId"] == attempts[1][0]["eventId"]
-    assert attempts[0][1]["webhook-id"] == attempts[1][1]["webhook-id"]
-    assert attempts[0][1]["webhook-timestamp"] != attempts[1][1]["webhook-timestamp"]
-    assert attempts[0][1]["webhook-signature"] != attempts[1][1]["webhook-signature"]
+    assert len(attempts) == 2
+    for projected, headers in attempts:
+        assert projected["eventId"] == headers["webhook-id"]
+        body = ev.canonical(projected)
+        timestamp = int(headers["webhook-timestamp"])
+        assert headers["webhook-signature"] == ev.sign(SECRET, projected["eventId"], timestamp, body)
+    first_headers, second_headers = (attempt[1] for attempt in attempts)
+    assert first_headers["webhook-id"] == second_headers["webhook-id"]
+    assert first_headers["webhook-timestamp"] != second_headers["webhook-timestamp"]
+    assert first_headers["webhook-signature"] != second_headers["webhook-signature"]
+    assert {k:v for k,v in first_headers.items() if k not in {"webhook-timestamp", "webhook-signature"}} == \
+           {k:v for k,v in second_headers.items() if k not in {"webhook-timestamp", "webhook-signature"}}
     assert attempts[0][0]["data"]["payload"]["prompt"] == "[REDACTED]"
     assert ev._drain("sub_retry", root)["accepted"] == 0
     assert len(attempts) == 2
@@ -133,7 +141,7 @@ def test_subscribe_projects_live_event_cursor_and_deduplicates(tmp_path, monkeyp
         assert event_call[1]["name"] == ev.EVENT_NAME
         assert event_call[1]["data"]["event_id"]
         assert event_call[1]["cursor"] == "1"
-        assert event_call[2]["webhook-id"].startswith("msg_")
+        assert event_call[2]["webhook-id"] == event_call[1]["eventId"]
         assert ev.project_pending(root)["accepted"] == 0
         assert live.high_watermark(root) == high_before
         assert len(live.read_since(0, hermes_root=root)[0]) == 1

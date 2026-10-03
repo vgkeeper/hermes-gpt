@@ -429,7 +429,7 @@ def _deliver(row: sqlite3.Row, event: dict[str, Any], retries: int = 3) -> bool:
     body = canonical(_project_event(event))
     if len(body) > MAX_BODY:
         return False
-    message_id = "msg_" + hashlib.sha256(f"{row['id']}\\0{event['event_id']}".encode()).hexdigest()
+    message_id = event["event_id"]
     for attempt in range(max(1, min(int(retries), 5))):
         try:
             headers = _signed_headers(row["secret"], message_id, body, row["id"], int(time.time()) + attempt)
