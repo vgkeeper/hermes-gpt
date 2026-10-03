@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import os
 import re
 import socket
@@ -22,6 +23,10 @@ BASE_URL_ENV = "HERMES_GPT_OPENHANDS_BASE_URL"
 MAX_PROMPT_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 256 * 1024
 MAX_TIMEOUT = 120
+DEFAULT_CONTRACT_TIMEOUT_SECONDS = 24 * 60 * 60
+MIN_CONTRACT_TIMEOUT_SECONDS = 60
+MAX_CONTRACT_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
+_USER_WAIT_STATUSES = frozenset({"awaiting_user_input", "waiting_for_user_input", "needs_user_input"})
 
 
 class UnsupportedResponseError(Exception):
@@ -34,6 +39,7 @@ _RUNTIME_ERRORS = (
     urllib.error.URLError,
     json.JSONDecodeError,
     UnsupportedResponseError,
+    TypeError,
     ValueError,
 )
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
@@ -160,9 +166,61 @@ def _make_prompt(contract: dict[str, Any]) -> str:
     return prompt
 
 
+def _contract_timeout_seconds(options: dict[str, Any]) -> int:
+    value = options.get("timeout_seconds", DEFAULT_CONTRACT_TIMEOUT_SECONDS)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not MIN_CONTRACT_TIMEOUT_SECONDS <= value <= MAX_CONTRACT_TIMEOUT_SECONDS
+    ):
+        raise ValueError("OPENHANDS_TIMEOUT_INVALID")
+    return value
+
+
+def _needs_attention(meta: dict[str, Any], error: str) -> None:
+    meta.update(state="needs_attention", outcome="needs_attention", error=error, ended_at=_now())
+
+
+def _deadline_error(meta: dict[str, Any], now: float | None = None) -> str:
+    timeout_seconds = meta.get("timeout_seconds")
+    started_at = meta.get("started_at_epoch")
+    deadline = meta.get("deadline_at_epoch")
+    if timeout_seconds is None or started_at is None or deadline is None:
+        return "OPENHANDS_DEADLINE_MISSING"
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or not MIN_CONTRACT_TIMEOUT_SECONDS <= timeout_seconds <= MAX_CONTRACT_TIMEOUT_SECONDS
+        or isinstance(started_at, bool)
+        or not isinstance(started_at, (int, float))
+        or isinstance(deadline, bool)
+        or not isinstance(deadline, (int, float))
+    ):
+        return "OPENHANDS_DEADLINE_INVALID"
+    try:
+        started_at = float(started_at)
+        deadline = float(deadline)
+    except (OverflowError, ValueError):
+        return "OPENHANDS_DEADLINE_INVALID"
+    if not math.isfinite(started_at) or not math.isfinite(deadline):
+        return "OPENHANDS_DEADLINE_INVALID"
+    if abs(deadline - started_at - timeout_seconds) > 0.001:
+        return "OPENHANDS_DEADLINE_INVALID"
+    if (time.time() if now is None else now) >= deadline:
+        return "OPENHANDS_CONTRACT_DEADLINE_EXCEEDED"
+    return ""
+
+
+def _request_timeout(meta: dict[str, Any]) -> int:
+    remaining = float(meta["deadline_at_epoch"]) - time.time()
+    return max(1, min(30, math.ceil(remaining)))
+
+
 def _state(result: dict[str, Any]) -> tuple[str, str]:
-    status = str(result.get("execution_status") or result.get("status") or "").strip().lower()
-    if status in {"queued", "pending", "created", "starting", "running", "awaiting_user_input"}:
+    status = str(result.get("execution_status") or result.get("status") or "").strip().lower().replace("-", "_")
+    if status in _USER_WAIT_STATUSES:
+        return "needs_attention", "OPENHANDS_USER_INPUT_REQUIRED"
+    if status in {"queued", "pending", "created", "starting", "running"}:
         return "running", ""
     if status in {"finished", "completed", "succeeded", "success"}:
         return "completed", ""
@@ -218,10 +276,14 @@ class OpenHandsBackend:
         if not isinstance(branch, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", branch) or ".." in branch.split("/"):
             return {"success": False, "code": "OPENHANDS_BRANCH_REQUIRED", "backend": self.name, "task_id": task_id}
         try:
+            contract_timeout = _contract_timeout_seconds(options)
             base_url, prompt = _base_url(), _make_prompt(contract)
         except ValueError as exc:
             return {"success": False, "code": str(exc) if str(exc).startswith("OPENHANDS_") else "OPENHANDS_CONFIGURATION_INVALID", "backend": self.name, "task_id": task_id}
-        plan = {"backend": self.name, "repository": repository, "branch": branch, "task_id": task_id}
+        plan = {
+            "backend": self.name, "repository": repository, "branch": branch,
+            "task_id": task_id, "timeout_seconds": contract_timeout,
+        }
         if effective_dry_run:
             return {"success": True, "dry_run": True, "changed": False, "backend": self.name, "plan": plan}
         if not confirm:
@@ -232,65 +294,111 @@ class OpenHandsBackend:
             key = ""
         if not isinstance(key, str) or not key.strip():
             return {"success": False, "code": "OPENHANDS_AUTH_REQUIRED", "backend": self.name, "task_id": task_id}
-        meta = {"task_id": task_id, "backend": self.name, "state": "starting", "outcome": "", "error": "", "repository": repository, "branch": branch, "created_at": _now(), "started_at": _now(), "ended_at": None, "conversation_id": "", "start_task_id": "", "next_poll_at": 0}
+        started_at = time.time()
+        meta = {
+            "task_id": task_id, "backend": self.name, "state": "starting", "outcome": "", "error": "",
+            "repository": repository, "branch": branch, "timeout_seconds": contract_timeout,
+            "started_at_epoch": started_at, "deadline_at_epoch": started_at + contract_timeout,
+            "created_at": _now(), "started_at": _now(),
+            "ended_at": None, "conversation_id": "", "start_task_id": "", "next_poll_at": 0,
+        }
         with jobs._record_lock(task_id, hermes_root):
             if _meta_path(task_id, hermes_root).exists():
                 return {"success": False, "code": "RUNNER_JOB_EXISTS", "backend": self.name, "task_id": task_id}
             _write_meta_unlocked(meta, hermes_root)
         try:
-            result = self.runtime.start(api_key=key.strip(), base_url=base_url, prompt=prompt, repository=repository, branch=branch, timeout=max(1, min(int(timeout), MAX_TIMEOUT)))
-            conversation_id, start_task_id = result.get("app_conversation_id"), result.get("id")
-            if isinstance(conversation_id, str) and _ID.fullmatch(conversation_id):
-                meta["conversation_id"] = conversation_id
-                meta["state"], meta["error"] = _state(result) if result.get("execution_status") or result.get("status") else ("running", "")
-            elif isinstance(start_task_id, str) and _ID.fullmatch(start_task_id) and str(result.get("status") or "pending").lower() in {"pending", "queued", "starting", "running", "ready"}:
-                meta.update(start_task_id=start_task_id, state="running", outcome="running")
+            result = self.runtime.start(api_key=key.strip(), base_url=base_url, prompt=prompt, repository=repository, branch=branch, timeout=max(1, min(int(timeout), MAX_TIMEOUT, contract_timeout)))
+            if not isinstance(result, dict):
+                raise UnsupportedResponseError("unsupported_start_response")
+            expired = _deadline_error(meta)
+            if expired:
+                _needs_attention(meta, expired)
             else:
-                meta.update(state="needs_attention", outcome="needs_attention", error="OPENHANDS_UNSUPPORTED_START_RESPONSE")
-            meta["outcome"] = meta["state"]
-            if meta["state"] in {"failed", "needs_attention"}:
-                meta["ended_at"] = _now()
+                conversation_id, start_task_id = result.get("app_conversation_id"), result.get("id")
+                if isinstance(conversation_id, str) and _ID.fullmatch(conversation_id):
+                    meta["conversation_id"] = conversation_id
+                    meta["state"], meta["error"] = _state(result) if result.get("execution_status") or result.get("status") else ("running", "")
+                elif isinstance(start_task_id, str) and _ID.fullmatch(start_task_id):
+                    start_status = str(result.get("status") or "pending").strip().lower().replace("-", "_")
+                    if start_status in _USER_WAIT_STATUSES:
+                        meta["start_task_id"] = start_task_id
+                        _needs_attention(meta, "OPENHANDS_USER_INPUT_REQUIRED")
+                    elif start_status in {"pending", "queued", "starting", "running", "ready"}:
+                        meta.update(start_task_id=start_task_id, state="running", outcome="running")
+                    else:
+                        _needs_attention(meta, "OPENHANDS_UNSUPPORTED_START_RESPONSE")
+                else:
+                    _needs_attention(meta, "OPENHANDS_UNSUPPORTED_START_RESPONSE")
+                meta["outcome"] = meta["state"]
+                if meta["state"] in {"failed", "needs_attention"}:
+                    meta["ended_at"] = _now()
             _write_meta(meta, hermes_root)
             if meta["state"] in {"failed", "needs_attention"}:
                 return {"success": False, "code": meta["error"], "backend": self.name, "task_id": task_id, "state": meta["state"]}
             return {"success": True, "changed": True, "dry_run": False, "backend": self.name, "task_id": task_id, "state": meta["state"]}
         except _RUNTIME_ERRORS as exc:
-            meta.update(state="needs_attention", outcome="needs_attention", error=_failure_code(exc), ended_at=_now())
+            _needs_attention(meta, _deadline_error(meta) or _failure_code(exc))
             _write_meta(meta, hermes_root)
             return {"success": False, "code": meta["error"], "backend": self.name, "task_id": task_id, "state": "needs_attention"}
         finally:
             del key
 
     def _refresh(self, meta: dict[str, Any], hermes_root: Path | None, *, locked: bool = False) -> dict[str, Any]:
-        if meta.get("state") in {"completed", "failed", "cancelled", "needs_attention"} or time.time() < float(meta.get("next_poll_at") or 0):
+        if meta.get("state") in {"completed", "failed", "cancelled", "needs_attention"}:
+            return meta
+        deadline_error = _deadline_error(meta)
+        if deadline_error:
+            _needs_attention(meta, deadline_error)
+            if locked:
+                _write_meta_unlocked(meta, hermes_root)
+            else:
+                _write_meta(meta, hermes_root)
+            return meta
+        if time.time() < float(meta.get("next_poll_at") or 0):
             return meta
         try:
             key = self.credential_provider()
         except OSError:
             key = ""
-        if not isinstance(key, str) or not key.strip():
-            meta.update(state="needs_attention", outcome="needs_attention", error="OPENHANDS_AUTH_REQUIRED", ended_at=_now())
+        deadline_error = _deadline_error(meta)
+        if deadline_error:
+            _needs_attention(meta, deadline_error)
+        elif not isinstance(key, str) or not key.strip():
+            _needs_attention(meta, "OPENHANDS_AUTH_REQUIRED")
         else:
             try:
                 base_url = _base_url()
                 waiting_for_start = False
+                request_timeout = _request_timeout(meta)
                 if meta.get("conversation_id"):
-                    result = self.runtime.conversation(api_key=key, base_url=base_url, conversation_id=meta["conversation_id"], timeout=30)
+                    result = self.runtime.conversation(
+                        api_key=key, base_url=base_url, conversation_id=meta["conversation_id"], timeout=request_timeout,
+                    )
                 elif meta.get("start_task_id"):
-                    task = self.runtime.start_task(api_key=key, base_url=base_url, task_id=meta["start_task_id"], timeout=30)
+                    task = self.runtime.start_task(
+                        api_key=key, base_url=base_url, task_id=meta["start_task_id"], timeout=request_timeout,
+                    )
                     if not isinstance(task, dict):
                         raise ValueError("unsupported_start_task_response")
-                    start_status = str(task.get("status") or "").upper()
-                    if start_status in {"ERROR", "FAILED", "CANCELLED", "CANCELED"}:
+                    start_status = str(task.get("status") or "").strip().lower().replace("-", "_")
+                    if start_status in {"error", "failed", "cancelled", "canceled"}:
                         meta.update(state="failed", outcome="failed", error="OPENHANDS_START_FAILED", ended_at=_now())
                         result = None
-                    elif start_status in {"READY", "DONE", "COMPLETED"}:
+                        waiting_for_start = True
+                    elif start_status in _USER_WAIT_STATUSES:
+                        _needs_attention(meta, "OPENHANDS_USER_INPUT_REQUIRED")
+                        result = None
+                        waiting_for_start = True
+                    elif start_status in {"ready", "done", "completed"}:
                         conversation_id = task.get("app_conversation_id")
                         if not isinstance(conversation_id, str) or not _ID.fullmatch(conversation_id):
                             raise ValueError("unsupported_start_task_response")
                         meta["conversation_id"] = conversation_id
-                        result = self.runtime.conversation(api_key=key, base_url=base_url, conversation_id=conversation_id, timeout=30)
-                    elif start_status in {"PENDING", "QUEUED", "RUNNING", "STARTING", "PROCESSING"}:
+                        result = self.runtime.conversation(
+                            api_key=key, base_url=base_url, conversation_id=conversation_id,
+                            timeout=_request_timeout(meta),
+                        )
+                    elif start_status in {"pending", "queued", "running", "starting", "processing"}:
                         meta.update(state="running", outcome="running")
                         waiting_for_start = True
                         result = None
@@ -307,9 +415,13 @@ class OpenHandsBackend:
                     meta["outcome"] = meta["state"]
                     if meta["state"] in {"completed", "failed", "needs_attention"}:
                         meta["ended_at"] = _now()
-                meta["next_poll_at"] = time.time() + 5
+                expired = _deadline_error(meta)
+                if expired:
+                    _needs_attention(meta, expired)
+                else:
+                    meta["next_poll_at"] = time.time() + 5
             except _RUNTIME_ERRORS as exc:
-                meta.update(state="needs_attention", outcome="needs_attention", error=_failure_code(exc), ended_at=_now())
+                _needs_attention(meta, _failure_code(exc))
             finally:
                 del key
         if locked:
