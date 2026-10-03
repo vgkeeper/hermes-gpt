@@ -205,6 +205,44 @@ def test_env_gates_expose_high_risk_tools(monkeypatch):
     assert "hermes_web_extract" in names
 
 
+def test_session_tools_have_explicit_safety_annotations(monkeypatch):
+    clear_gate_envs(monkeypatch)
+    monkeypatch.setenv(server.ENABLE_SESSION_SEARCH_ENV, "1")
+    monkeypatch.setenv(server.ENABLE_SESSION_CONTROL_ENV, "1")
+
+    tools = tools_by_name(server.build_server())
+
+    for name in [
+        "hermes_session_search",
+        "hermes_session_list",
+        "hermes_session_read",
+        "hermes_session_export",
+        "hermes_bot_chat_get",
+        "hermes_session_job_status",
+        "hermes_session_job_result",
+        "hermes_session_job_result_page",
+        "hermes_session_job_wait",
+    ]:
+        annotations = tools[name].annotations
+        assert annotations is not None
+        assert annotations.readOnlyHint is True
+        assert annotations.destructiveHint is False
+        assert annotations.openWorldHint is False
+
+    for name in [
+        "hermes_session_continue",
+        "hermes_session_send",
+        "hermes_session_create",
+        "hermes_bot_chat_send",
+    ]:
+        annotations = tools[name].annotations
+        assert annotations is not None
+        assert annotations.readOnlyHint is False
+        assert annotations.destructiveHint is False
+        assert annotations.openWorldHint is False
+        assert annotations.idempotentHint is False
+
+
 def test_memory_write_actions_are_disabled_by_default(monkeypatch):
     clear_gate_envs(monkeypatch)
     monkeypatch.setattr(server, "require_imports", lambda: None)
