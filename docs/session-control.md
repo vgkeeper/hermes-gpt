@@ -30,7 +30,7 @@ runtime with shared-state disabled can still write a false orphan marker.
 ## Workflow
 
 1. Find a session ID with `hermes_session_list` when history is enabled.
-2. Call `hermes_session_continue(session_id, prompt, max_job_runtime_seconds)` or its `hermes_session_send` alias.
+2. Call `hermes_session_continue(session_id, prompt, max_job_runtime_seconds, mission_id)` or its `hermes_session_send` alias. `mission_id` is optional; `hermes_session_create` accepts it too because it also creates an asynchronous job.
 3. Save the returned `job_id`.
 4. Poll `hermes_session_job_status(job_id)` until the status is `completed`, `failed`, `timed_out`, or `orphaned`.
 5. Call `hermes_session_job_result(job_id)` for the bounded, redacted final output.
@@ -41,7 +41,7 @@ The start call resolves exact or unique-prefix IDs through Hermes' existing read
 hermes --resume <resolved-session-id> --oneshot <prompt>
 ```
 
-No shell is used. Hermes restores the resumed session's recorded working directory using its normal CLI behavior. The worker, not the MCP server process, holds the shared session lock, renews the lease, enforces the runtime deadline, captures output, and publishes the terminal job record.
+No shell is used. Hermes restores the resumed session's recorded working directory using its normal CLI behavior. The worker, not the MCP server process, holds the shared session lock, renews the lease, enforces the runtime deadline, captures output, and publishes the terminal job record. The optional `mission_id` is validated with the Live Events safe-reference bounds and persisted in the job metadata. After atomically writing a terminal status, the worker publishes one deterministic-ID `topic=session`, `kind=job.terminal` event for that job. The bounded payload contains only `job_id`, `session_id`, `status`, and `return_code` when available; it never contains the prompt or job output. Empty `mission_id` preserves historical behavior and emits no event. A restarted reader retries publication from terminal metadata, while the event ID prevents a duplicate durable row. Events are notifications only; consumers re-read job status/result as authoritative evidence.
 
 ## Creating a new session
 

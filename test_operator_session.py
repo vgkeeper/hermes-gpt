@@ -6,7 +6,11 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import operator_live_events as live_events
+import operator_policy as op
 import operator_session as session
+import operator_session_worker as worker
+import server
 
 
 class _ImmediateThread:
@@ -60,6 +64,8 @@ def test_session_control_is_disabled_by_default(monkeypatch, tmp_path):
 
 def test_mocked_continue_status_and_result(monkeypatch, tmp_path):
     monkeypatch.setenv(session.ENABLE_SESSION_CONTROL_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "read_only")
     monkeypatch.setattr(session.threading, "Thread", _ImmediateThread)
     calls = []
 
@@ -77,6 +83,7 @@ def test_mocked_continue_status_and_result(monkeypatch, tmp_path):
         hermes_root=tmp_path,
         agent_root=tmp_path / "agent",
         profile="project-manager",
+        mission_id="msn-session-test",
     )
     assert started["success"] is True
     assert len(calls) == 1
@@ -93,6 +100,12 @@ def test_mocked_continue_status_and_result(monkeypatch, tmp_path):
     assert status["job"]["timeout"] == session.MAX_JOB_RUNTIME_SECONDS
     assert status["job"]["max_job_runtime_seconds"] == session.MAX_JOB_RUNTIME_SECONDS
     assert status["job"]["profile"] == "project-manager"
+    assert status["job"]["mission_id"] == "msn-session-test"
+    event_result = json.loads(live_events.hermes_live_events_since(0, mission_id="msn-session-test", hermes_root=tmp_path))
+    assert len(event_result["events"]) == 1
+    assert event_result["events"][0]["kind"] == "job.terminal"
+    assert event_result["events"][0]["payload"]["job_id"] == started["job_id"]
+    assert prompt not in json.dumps(event_result["events"][0]["payload"])
     metadata_text = json.dumps(status)
     assert prompt not in metadata_text
     assert status["job"]["prompt_len"] == len(prompt)
@@ -356,6 +369,7 @@ def test_session_create_builds_new_distinct_session(monkeypatch, tmp_path):
         agent_root=tmp_path / "agent",
         profile="project-manager",
         title="My fresh session",
+        mission_id="msn-created-session",
     )
     # async shape
     assert started["success"] is True
@@ -364,6 +378,7 @@ def test_session_create_builds_new_distinct_session(monkeypatch, tmp_path):
     assert started["status"] == "running"
     assert session._load(started["job_id"], tmp_path)["max_job_runtime_seconds"] == 7200
     assert session._load(started["job_id"], tmp_path)["timeout"] == 7200
+    assert session._load(started["job_id"], tmp_path)["mission_id"] == "msn-created-session"
     # a new session was created in the DB, distinct from any caller-supplied id
     assert len(fake_db.created) == 1
     new_sid, source = fake_db.created[0]
@@ -613,3 +628,120 @@ def test_shared_file_lock_allows_only_one_concurrent_continue(monkeypatch, tmp_p
     ]
     assert len(files) == 1
     assert session.hermes_session_job_wait(first["job_id"], wait_seconds=8, hermes_root=tmp_path)["status"] == "completed"
+
+
+def test_mission_id_validation_and_tool_surface_compatibility(monkeypatch, tmp_path):
+    import inspect
+
+    monkeypatch.setenv(session.ENABLE_SESSION_CONTROL_ENV, "1")
+    invalid = session.hermes_session_continue(
+        "session-safe", "turn", mission_id="bad mission", hermes_root=tmp_path
+    )
+    assert invalid["code"] == "INVALID_MISSION_ID"
+    for tool in (
+        server.hermes_session_continue,
+        server.hermes_session_send,
+        server.hermes_session_create,
+    ):
+        assert inspect.signature(tool).parameters["mission_id"].default == ""
+
+
+def test_worker_terminal_event_waits_for_persisted_state_and_reconciles_idempotently(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "read_only")
+    hermes_root = tmp_path / "hermes"
+    job_id = "a" * 32
+    mission_id = "msn-worker-wakeup"
+    metadata_path, _ = session._paths(job_id, hermes_root)
+    lease_path = session._session_lease_paths("session-wakeup", "default", hermes_root)[
+        1
+    ]
+    session._save(
+        {
+            "job_id": job_id,
+            "session_id": "session-wakeup",
+            "profile": "default",
+            "mission_id": mission_id,
+            "status": "running",
+            "return_code": None,
+            "owner_token": "owner-test",
+            "prompt_len": 29,
+            "prompt_sha256": "not-a-prompt",
+        },
+        hermes_root,
+    )
+    config = {
+        "job_id": job_id,
+        "metadata_path": str(metadata_path),
+        "session_id": "session-wakeup",
+        "profile": "default",
+        "owner_token": "owner-test",
+        "owner_instance_id": "test-instance",
+        "owner_container": "test-container",
+        "lease_path": str(lease_path),
+    }
+
+    worker._write_owner_state(config, "running")
+    before_terminal = json.loads(
+        live_events.hermes_live_events_since(0, hermes_root=hermes_root)
+    )
+    assert before_terminal["events"] == []
+
+    real_publish = live_events.publish_event
+    attempts = []
+
+    def fail_once_after_durable_terminal(**kwargs):
+        durable = json.loads(metadata_path.read_text(encoding="utf-8"))
+        assert durable["status"] == "completed"
+        attempts.append(kwargs)
+        raise OSError("temporary event store failure")
+
+    monkeypatch.setattr(live_events, "publish_event", fail_once_after_durable_terminal)
+    worker._write_owner_state(config, "completed", 0)
+    persisted = session._load(job_id, hermes_root)
+    assert persisted["mission_id"] == mission_id
+    assert persisted["status"] == "completed"
+    assert len(attempts) == 1
+
+    monkeypatch.setattr(live_events, "publish_event", real_publish)
+    session._reconcile(hermes_root)  # a restarted reader retries from durable metadata
+    session._reconcile(hermes_root)  # repeated observations remain idempotent
+    result = json.loads(
+        live_events.hermes_live_events_since(
+            0, mission_id=mission_id, hermes_root=hermes_root
+        )
+    )
+    assert len(result["events"]) == 1
+    event = result["events"][0]
+    assert (event["topic"], event["kind"], event["subject_type"]) == (
+        "session",
+        "job.terminal",
+        "job",
+    )
+    assert event["subject_id"] == job_id
+    assert event["source"] == "session-runtime"
+    assert event["event_id"] == f"lev-session-job-{job_id}"
+    assert event["payload"] == {
+        "job_id": job_id,
+        "session_id": "session-wakeup",
+        "status": "completed",
+        "return_code": 0,
+    }
+    assert "prompt" not in json.dumps(event["payload"]).lower()
+    assert "not-a-prompt" not in json.dumps(event["payload"])
+
+
+
+def test_legacy_terminal_job_without_mission_id_emits_no_event(monkeypatch, tmp_path):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "read_only")
+    job_id = "b" * 32
+    session._save(
+        {"job_id": job_id, "session_id": "legacy-session", "status": "completed", "return_code": 0},
+        tmp_path,
+    )
+    session._reconcile(tmp_path)
+    events = json.loads(live_events.hermes_live_events_since(0, hermes_root=tmp_path))
+    assert events["events"] == []
