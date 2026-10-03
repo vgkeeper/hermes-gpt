@@ -3396,21 +3396,68 @@ def register_tools(server: FastMCP) -> None:
     if env_enabled(ENABLE_TERMINAL_ENV):
         server.add_tool(hermes_run_command, meta=tool_meta())
     if env_enabled(ENABLE_SESSION_SEARCH_ENV):
-        server.add_tool(hermes_session_search, meta=tool_meta())
-        server.add_tool(hermes_session_list, meta=tool_meta())
-        server.add_tool(hermes_session_read, meta=tool_meta())
-        server.add_tool(hermes_session_export, meta=tool_meta())
-        server.add_tool(hermes_bot_chat_get, meta=tool_meta())
+        for _session_read_tool, _session_read_title in (
+            (hermes_session_search, "Search Hermes session history"),
+            (hermes_session_list, "List Hermes sessions"),
+            (hermes_session_read, "Read Hermes session messages"),
+            (hermes_session_export, "Export Hermes session messages"),
+            (hermes_bot_chat_get, "Read the canonical Hermes Bot Chat"),
+        ):
+            server.add_tool(
+                _session_read_tool,
+                meta=tool_meta(),
+                annotations=ToolAnnotations(
+                    title=_session_read_title,
+                    readOnlyHint=True,
+                    destructiveHint=False,
+                    openWorldHint=False,
+                ),
+            )
     if env_enabled(ENABLE_SESSION_CONTROL_ENV):
-        server.add_tool(hermes_session_continue, meta=tool_meta())
-        server.add_tool(hermes_session_send, meta=tool_meta())
-        server.add_tool(hermes_session_create, meta=tool_meta())
+        for _session_write_tool, _session_write_title in (
+            (hermes_session_continue, "Continue a Hermes session in a background job"),
+            (hermes_session_send, "Send work to an existing Hermes session"),
+            (hermes_session_create, "Create a Hermes session and start its first background job"),
+        ):
+            server.add_tool(
+                _session_write_tool,
+                meta=tool_meta(),
+                annotations=ToolAnnotations(
+                    title=_session_write_title,
+                    readOnlyHint=False,
+                    destructiveHint=False,
+                    openWorldHint=False,
+                    idempotentHint=False,
+                ),
+            )
         if env_enabled(ENABLE_SESSION_SEARCH_ENV):
-            server.add_tool(hermes_bot_chat_send, meta=tool_meta())
-        server.add_tool(hermes_session_job_status, meta=tool_meta())
-        server.add_tool(hermes_session_job_result, meta=tool_meta())
-        server.add_tool(hermes_session_job_result_page, meta=tool_meta())
-        server.add_tool(hermes_session_job_wait, meta=tool_meta())
+            server.add_tool(
+                hermes_bot_chat_send,
+                meta=tool_meta(),
+                annotations=ToolAnnotations(
+                    title="Send work to the canonical Hermes Bot Chat",
+                    readOnlyHint=False,
+                    destructiveHint=False,
+                    openWorldHint=False,
+                    idempotentHint=False,
+                ),
+            )
+        for _session_job_read_tool, _session_job_read_title in (
+            (hermes_session_job_status, "Read Hermes session-job status"),
+            (hermes_session_job_result, "Read Hermes session-job result"),
+            (hermes_session_job_result_page, "Read a page of a Hermes session-job result"),
+            (hermes_session_job_wait, "Wait for Hermes session-job terminal state"),
+        ):
+            server.add_tool(
+                _session_job_read_tool,
+                meta=tool_meta(),
+                annotations=ToolAnnotations(
+                    title=_session_job_read_title,
+                    readOnlyHint=True,
+                    destructiveHint=False,
+                    openWorldHint=False,
+                ),
+            )
     op_work_bridge.register_tools(server, meta=tool_meta())
     if env_enabled(ENABLE_VISION_ENV):
         server.add_tool(hermes_vision_analyze, meta=tool_meta())
