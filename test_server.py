@@ -225,9 +225,9 @@ def test_session_tools_have_explicit_safety_annotations(monkeypatch):
     ]:
         annotations = tools[name].annotations
         assert annotations is not None
-        assert annotations.readOnlyHint is True
-        assert annotations.destructiveHint is False
-        assert annotations.openWorldHint is False
+        assert annotations.read_only_hint is True
+        assert annotations.destructive_hint is False
+        assert annotations.open_world_hint is False
 
     for name in [
         "hermes_session_continue",
@@ -237,10 +237,10 @@ def test_session_tools_have_explicit_safety_annotations(monkeypatch):
     ]:
         annotations = tools[name].annotations
         assert annotations is not None
-        assert annotations.readOnlyHint is False
-        assert annotations.destructiveHint is False
-        assert annotations.openWorldHint is False
-        assert annotations.idempotentHint is False
+        assert annotations.read_only_hint is False
+        assert annotations.destructive_hint is False
+        assert annotations.open_world_hint is False
+        assert annotations.idempotent_hint is False
 
 
 def test_memory_write_actions_are_disabled_by_default(monkeypatch):
