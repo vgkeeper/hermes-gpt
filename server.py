@@ -1333,6 +1333,15 @@ def hermes_session_continue(
         ),
     ] = DEFAULT_SESSION_MAX_RUNTIME_SECONDS,
     profile: str = "default",
+    mission_id: Annotated[
+        str,
+        Field(
+            description=(
+                "Optional Mission ID to associate with this job. A terminal job publishes "
+                "a session/job.terminal wake-up event when set; omit it for historical behavior."
+            )
+        ),
+    ] = "",
 ) -> dict[str, Any]:
     """Start one bounded, asynchronous turn in an existing Hermes session for a profile."""
     safe_profile = _validate_session_profile(profile)
@@ -1347,6 +1356,7 @@ def hermes_session_continue(
                 hermes_root=_default_hermes_root(),
                 agent_root=HERMES_ROOT,
                 profile=safe_profile,
+                mission_id=mission_id,
             )
         adapter.open()
         resolved_id = adapter.resolve_session_id(session_id)
@@ -1364,6 +1374,7 @@ def hermes_session_continue(
             hermes_root=_default_hermes_root(),
             agent_root=HERMES_ROOT,
             profile=safe_profile,
+            mission_id=mission_id,
         )
     except _SESSION_ERRORS as exc:
         return op_policy.make_error_envelope(
@@ -1385,6 +1396,10 @@ def hermes_session_send(
         le=DEFAULT_SESSION_MAX_RUNTIME_SECONDS,
     )] = DEFAULT_SESSION_MAX_RUNTIME_SECONDS,
     profile: str = "default",
+    mission_id: Annotated[
+        str,
+        Field(description="Optional Mission ID for the terminal session/job wake-up event."),
+    ] = "",
 ) -> dict[str, Any]:
     """Alias for profile-aware hermes_session_continue for clients that use send terminology."""
     return hermes_session_continue(
@@ -1392,6 +1407,7 @@ def hermes_session_send(
         prompt,
         max_job_runtime_seconds=max_job_runtime_seconds,
         profile=profile,
+        mission_id=mission_id,
     )
 
 
@@ -1410,6 +1426,10 @@ def hermes_session_create(
     ] = DEFAULT_SESSION_MAX_RUNTIME_SECONDS,
     profile: str = "default",
     title: str | None = None,
+    mission_id: Annotated[
+        str,
+        Field(description="Optional Mission ID for the terminal session/job wake-up event."),
+    ] = "",
 ) -> dict[str, Any]:
     """Create a new Hermes session and start its first work asynchronously.
 
@@ -1435,6 +1455,7 @@ def hermes_session_create(
             agent_root=HERMES_ROOT,
             profile=safe_profile,
             title=title,
+            mission_id=mission_id,
         )
     except _SESSION_ERRORS as exc:
         return op_policy.make_error_envelope(

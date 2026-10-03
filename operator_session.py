@@ -23,6 +23,7 @@ try:
 except ImportError:  # pragma: no cover - Windows fallback keeps legacy behavior
     fcntl = None
 
+import operator_live_events as op_live_events
 import operator_policy as op
 
 ENABLE_SESSION_CONTROL_ENV = "HERMES_GPT_ENABLE_SESSION_CONTROL"
@@ -141,6 +142,46 @@ def _error(code: str, message: str, action: str) -> dict[str, Any]:
     )
 
 
+def _publish_terminal_event(meta: dict[str, Any], hermes_root: Path | None = None) -> None:
+    """Publish an idempotent wake-up after the terminal job record is durable."""
+    status = meta.get("status")
+    mission_id = meta.get("mission_id", "")
+    job_id = str(meta.get("job_id", ""))
+    if status not in _SESSION_TERMINAL_STATES or not mission_id or meta.get("terminal_event_published"):
+        return
+    if not re.fullmatch(r"[0-9a-f]{32}", job_id):
+        return
+    payload: dict[str, Any] = {
+        "job_id": job_id,
+        "session_id": str(meta.get("session_id", ""))[:256],
+        "status": status,
+    }
+    return_code = meta.get("return_code")
+    if (
+        isinstance(return_code, int)
+        and not isinstance(return_code, bool)
+        and -(2**31) <= return_code <= 2**31 - 1
+    ):
+        payload["return_code"] = return_code
+    try:
+        op_live_events.publish_event(
+            topic="session",
+            kind="job.terminal",
+            subject_type="job",
+            subject_id=job_id,
+            mission_id=mission_id,
+            source="session-runtime",
+            payload=payload,
+            event_id=f"lev-session-job-{job_id}",
+            hermes_root=hermes_root,
+        )
+        meta["terminal_event_published"] = True
+        _save(meta, hermes_root)
+    except (OSError, ValueError, TypeError, sqlite3.Error):
+        # Notifications are best-effort; durable job status/result stays authoritative.
+        return
+
+
 def _redact(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): _redact(item) for key, item in value.items()}
@@ -155,8 +196,14 @@ def _save(meta: dict[str, Any], hermes_root: Path | None = None) -> None:
     path, _ = _paths(meta["job_id"], hermes_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    temp.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
-    temp.replace(path)
+    try:
+        with temp.open("w", encoding="utf-8") as stream:
+            stream.write(json.dumps(meta, indent=2, sort_keys=True))
+            stream.flush()
+            os.fsync(stream.fileno())
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def _load(job_id: str, hermes_root: Path | None = None) -> dict[str, Any] | None:
@@ -297,6 +344,7 @@ def _job_view(meta: dict[str, Any], hermes_root: Path | None = None) -> dict[str
         "owner_pid_start_token",
         "lease_expires_at",
         "heartbeat_at",
+        "terminal_event_published",
     ):
         view.pop(key, None)
     lease_status, _ = _lease_state(meta, hermes_root)
@@ -323,8 +371,12 @@ def _hermes_executable(agent_root: Path | None = None) -> str:
 
 
 def _validate_start(
-    session_id: str, prompt: str, max_job_runtime_seconds: int, profile: str = "default"
-) -> tuple[str, str, int, str] | dict[str, Any]:
+    session_id: str,
+    prompt: str,
+    max_job_runtime_seconds: int,
+    profile: str = "default",
+    mission_id: str = "",
+) -> tuple[str, str, int, str, str] | dict[str, Any]:
     if not op.env_truthy(ENABLE_SESSION_CONTROL_ENV):
         return _error(
             "SESSION_CONTROL_DISABLED",
@@ -347,7 +399,11 @@ def _validate_start(
         safe_profile = op.validate_profile_name(profile)
     except ValueError:
         return _error("INVALID_PROFILE", "profile is not a valid Hermes profile name.", "Use an authorized profile name.")
-    return session_id.strip(), prompt, max(MIN_JOB_RUNTIME_SECONDS, min(max_job_runtime_seconds, MAX_JOB_RUNTIME_SECONDS)), safe_profile
+    try:
+        safe_mission_id = op_live_events._bounded_ref(mission_id, "mission_id", op_live_events.MAX_SUBJECT)
+    except (TypeError, ValueError):
+        return _error("INVALID_MISSION_ID", "mission_id is not a valid bounded reference.", "Use a mission ID with supported reference characters, or omit it.")
+    return session_id.strip(), prompt, max(MIN_JOB_RUNTIME_SECONDS, min(max_job_runtime_seconds, MAX_JOB_RUNTIME_SECONDS)), safe_profile, safe_mission_id
 
 
 def hermes_session_continue(
@@ -358,13 +414,14 @@ def hermes_session_continue(
     hermes_root: Path | None = None,
     agent_root: Path | None = None,
     profile: str = "default",
+    mission_id: str = "",
 ) -> dict[str, Any]:
     """Start one bounded non-interactive turn in an existing Hermes session."""
-    checked = _validate_start(session_id, prompt, max_job_runtime_seconds, profile)
+    checked = _validate_start(session_id, prompt, max_job_runtime_seconds, profile, mission_id)
     if isinstance(checked, dict):
         return checked
-    safe_id, safe_prompt, safe_timeout, safe_profile = checked
-    return _start_job(safe_id, safe_prompt, safe_timeout, safe_profile, hermes_root, agent_root)
+    safe_id, safe_prompt, safe_timeout, safe_profile, safe_mission_id = checked
+    return _start_job(safe_id, safe_prompt, safe_timeout, safe_profile, hermes_root, agent_root, safe_mission_id)
 
 
 def _start_job(
@@ -374,6 +431,7 @@ def _start_job(
     safe_profile: str,
     hermes_root: Path | None,
     agent_root: Path | None,
+    mission_id: str = "",
 ) -> dict[str, Any]:
     """Register and launch one bounded non-interactive Hermes turn as a job.
 
@@ -410,6 +468,7 @@ def _start_job(
         "job_id": job_id,
         "session_id": safe_id,
         "profile": safe_profile,
+        "mission_id": mission_id,
         "status": "starting",
         "created_at": _now(),
         "started_at": None,
@@ -513,6 +572,7 @@ def _start_job(
                 _active_sessions.pop(active_key, None)
         meta.update({"status": "failed", "return_code": None, "ended_at": _now()})
         _save(meta, hermes_root)
+        _publish_terminal_event(meta, hermes_root)
         return _error(
             "HERMES_START_FAILED",
             op.redact_output(str(exc)),
@@ -535,8 +595,12 @@ def _start_job(
 
 
 def _validate_create(
-    prompt: str, max_job_runtime_seconds: int, profile: str, title: str | None = None
-) -> tuple[str, int, str, str | None] | dict[str, Any]:
+    prompt: str,
+    max_job_runtime_seconds: int,
+    profile: str,
+    title: str | None = None,
+    mission_id: str = "",
+) -> tuple[str, int, str, str | None, str] | dict[str, Any]:
     """Validate inputs for :func:`hermes_session_create` (no existing session id).
 
     Mirrors the session-continue validation for the shared fields (prompt,
@@ -571,11 +635,16 @@ def _validate_create(
         if len(title) > MAX_SESSION_TITLE_CHARS:
             return _error("INVALID_TITLE", f"title exceeds the {MAX_SESSION_TITLE_CHARS}-character limit.", "Send a shorter title.")
         safe_title = title.strip()
+    try:
+        safe_mission_id = op_live_events._bounded_ref(mission_id, "mission_id", op_live_events.MAX_SUBJECT)
+    except (TypeError, ValueError):
+        return _error("INVALID_MISSION_ID", "mission_id is not a valid bounded reference.", "Use a mission ID with supported reference characters, or omit it.")
     return (
         prompt.strip(),
         max(MIN_JOB_RUNTIME_SECONDS, min(max_job_runtime_seconds, MAX_JOB_RUNTIME_SECONDS)),
         safe_profile,
         safe_title,
+        safe_mission_id,
     )
 
 
@@ -614,6 +683,7 @@ def hermes_session_create(
     agent_root: Path | None = None,
     profile: str = "default",
     title: str | None = None,
+    mission_id: str = "",
 ) -> dict[str, Any]:
     """Create a new Hermes session and start its first work asynchronously.
 
@@ -624,10 +694,10 @@ def hermes_session_create(
     followed with :func:`hermes_session_job_wait` then
     :func:`hermes_session_job_result`.
     """
-    checked = _validate_create(prompt, max_job_runtime_seconds, profile, title)
+    checked = _validate_create(prompt, max_job_runtime_seconds, profile, title, mission_id)
     if isinstance(checked, dict):
         return checked
-    safe_prompt, safe_timeout, safe_profile, safe_title = checked
+    safe_prompt, safe_timeout, safe_profile, safe_title, safe_mission_id = checked
     new_session_id = _new_session_id()
     try:
         if not _create_session_in_db(new_session_id, safe_profile, safe_title, hermes_root):
@@ -642,7 +712,7 @@ def hermes_session_create(
             op.redact_output(str(exc)),
             "Check the Hermes session database and profile.",
         )
-    return _start_job(new_session_id, safe_prompt, safe_timeout, safe_profile, hermes_root, agent_root)
+    return _start_job(new_session_id, safe_prompt, safe_timeout, safe_profile, hermes_root, agent_root, safe_mission_id)
 
 
 def _watch(job_id: str, proc: subprocess.Popen[str], output: Any, timeout: int, hermes_root: Path | None) -> None:
@@ -668,6 +738,7 @@ def _watch(job_id: str, proc: subprocess.Popen[str], output: Any, timeout: int, 
     if meta.get("status") not in _SESSION_TERMINAL_STATES:
         meta.update({"status": fallback_status, "return_code": proc.poll(), "ended_at": _now()})
         _save(meta, hermes_root)
+    _publish_terminal_event(_load(job_id, hermes_root) or meta, hermes_root)
 
 
 def _terminate(proc: subprocess.Popen[str]) -> None:
@@ -720,6 +791,7 @@ def _reconcile(hermes_root: Path | None = None) -> None:
             with _lock:
                 _processes.pop(job_id, None)
         if status in _SESSION_TERMINAL_STATES:
+            _publish_terminal_event(meta, hermes_root)
             continue
         has_lease = bool(meta.get("owner_token"))
         active_state = status in ({"starting", "running"} if shared_state else {"running"})
@@ -750,6 +822,7 @@ def _reconcile(hermes_root: Path | None = None) -> None:
                 "reconciliation": "server restarted; process ownership could not be proven",
             })
         _save(meta, hermes_root)
+        _publish_terminal_event(meta, hermes_root)
 
 
 def hermes_session_job_status(job_id: str, hermes_root: Path | None = None) -> dict[str, Any]:

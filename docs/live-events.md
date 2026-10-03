@@ -33,7 +33,7 @@ Event IDs are idempotent. Consumers should persist the returned cursor and resum
 
 ## Producers
 
-The initial v0.9 producers are first-class Mission lifecycle changes and Swarm operator actions. Producer failure is deliberately non-fatal: publishing a wake-up event cannot roll back or modify the authoritative transaction that produced it.
+Producers include first-class Mission lifecycle changes, Swarm operator actions, and session-control jobs with an explicitly supplied `mission_id`. Session jobs publish `session/job.terminal` only after durable terminal metadata is written, using a deterministic event ID and a bounded payload without prompts or output. Producer failure is deliberately non-fatal: publishing a wake-up event cannot roll back or modify the authoritative transaction that produced it. Consumers re-read the authoritative job status/result before acting.
 
 ## Retention
 

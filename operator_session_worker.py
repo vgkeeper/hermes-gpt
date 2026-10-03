@@ -20,6 +20,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import operator_session as op_session
+
 HEARTBEAT_SECONDS = 2.0
 LEASE_SECONDS = 12.0
 _shutdown = threading.Event()
@@ -112,6 +114,7 @@ def _write_owner_state(config: dict[str, Any], state: str, return_code: int | No
     # Publish the matching sidecar before marking the shared job as running.
     _atomic_json(lease_path, lease)
     _atomic_json(meta_path, meta)
+    op_session._publish_terminal_event(meta, meta_path.parent.parent)
 
 
 def _kill_child(proc: subprocess.Popen[Any]) -> None:

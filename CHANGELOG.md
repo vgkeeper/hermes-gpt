@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added optional `mission_id` association to asynchronous session-create/continue jobs. The worker persists it and publishes an idempotent `session/job.terminal` Live Event only after durable terminal status; event payloads exclude prompts and output, and job status/result semantics remain unchanged.
+
 - Added four narrow authenticated Hermes Work Bridge adapter tools (register/update/get/cancel) to the Hermes Pilote MCP. The bridge remains a separate service/repository; this module only calls its fixed API and never implements monitoring or Slack delivery. The adapter can read its bearer credential from an explicitly mounted token file (`HERMES_WORK_BRIDGE_TOKEN_FILE`) so the secret is scoped to the Pilote runtime. Setup and Work/Sheet protocol: `docs/work-bridge.md`.
 
 - Refactored the draft OpenAI MCP Events extension into a projection of the durable Live Events journal. `operator_mcp_events` stores only subscription/cursor/lease state; it does not maintain a second business event journal or republish callbacks. Delivery is bounded and at-least-once, cursors checkpoint only after callback acceptance, and consumers must treat notifications as wake-ups rather than completion evidence. Modern protocol tests remain SDK 2.x-only with an explicit SDK 1.x skip; legacy tools remain covered on both SDK families.
