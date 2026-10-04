@@ -639,20 +639,57 @@ class EventsASGIMiddleware:
             meta = params.get("_meta", {}) if isinstance(params, dict) else {}
             if not isinstance(meta, dict):
                 meta = {}
-            modern = (
-                headers.get(b"mcp-protocol-version") == PROTOCOL.encode()
-                or meta.get("io.modelcontextprotocol/protocolVersion") == PROTOCOL
-            )
+            header_version = headers.get(b"mcp-protocol-version", b"").decode("ascii", "ignore")
+            meta_version = meta.get("io.modelcontextprotocol/protocolVersion")
+            modern = header_version == PROTOCOL or meta_version == PROTOCOL
+            protocol = PROTOCOL if modern else header_version or (meta_version if isinstance(meta_version, str) else "unknown")
+            source = "header+meta" if header_version and meta_version else "header" if header_version else "meta" if meta_version else "none"
             method = payload.get("method")
-            if method in {"server/discover", "events/list", "events/subscribe", "events/unsubscribe"} and modern:
+            tracked = method in {"server/discover", "events/list", "events/subscribe", "events/unsubscribe"}
+            if tracked and modern:
+                started = time.perf_counter()
+                reqid = _safe_request_id(payload.get("id"))
                 root = self.hermes_root_getter() if self.hermes_root_getter else None
                 try:
                     result = await dispatch(payload, _principal(scope.get("headers", [])), root)
                 except (OSError, sqlite3.Error):
                     result = {"jsonrpc": "2.0", "id": payload.get("id"), "error": {"code": -32603, "message": "Internal error"}}
                 if result is not None:
+                    error = result.get("error") if isinstance(result, dict) else None
+                    code = error.get("code") if isinstance(error, dict) else None
+                    _log_events_rpc(method, protocol, source, reqid, "error" if error else "success", code, started)
                     raw = json.dumps(result, separators=(",", ":"), ensure_ascii=False).encode()
                     await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(raw)).encode())]})
                     await send({"type": "http.response.body", "body": raw})
                     return
+            elif tracked:
+                started = time.perf_counter()
+                reqid = _safe_request_id(payload.get("id"))
+                status = {"value": None}
+                async def observed_send(message):
+                    if message.get("type") == "http.response.start":
+                        status["value"] = message.get("status")
+                    await send(message)
+                await self.app(scope, replay_receive_factory(), observed_send)
+                http_status = status["value"]
+                outcome = "success" if isinstance(http_status, int) and 200 <= http_status < 400 else "error"
+                _log_events_rpc(method, protocol, source, reqid, outcome, http_status, started)
+                return
         await self.app(scope, replay_receive_factory(), send)
+
+
+def _safe_request_id(value: Any) -> str | int | None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value if 0 <= value <= 2**53 - 1 else None
+    if isinstance(value, str) and len(value) <= 256:
+        return "rid_" + hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:16]
+    return None
+
+
+def _log_events_rpc(method: str, protocol: str, source: str, request_id: Any,
+                    outcome: str, code: Any, started: float) -> None:
+    _LOG.info("mcp_events_rpc timestamp=%s method=%s protocol=%s detection_source=%s request_id=%s outcome=%s code=%s duration_ms=%.3f",
+              datetime.now(timezone.utc).isoformat(), method, protocol[:32], source,
+              request_id if request_id is not None else "-", outcome,
+              code if isinstance(code, int) and not isinstance(code, bool) else "-",
+              max(0.0, (time.perf_counter() - started) * 1000))
