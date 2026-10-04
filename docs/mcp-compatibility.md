@@ -57,12 +57,14 @@ the last accepted event and is retried with bounded backoff. The journal remains
 the source of truth; the cursor is projection state, not proof of completion.
 
 The extension is intercepted only on the authenticated `/mcp` Streamable HTTP
-endpoint for SDK 2.x modern requests. The middleware emits one structured
-`hermes_gpt.mcp_events` INFO record for each observed `server/discover`,
-`events/list`, `events/subscribe`, and `events/unsubscribe` request. Fields are
-UTC timestamp, method, detected protocol, detection source (`header`, `meta`,
-`header+meta`, or `none`), a bounded hashed string request ID (or safe numeric
-ID), outcome, logical/HTTP code, and elapsed milliseconds. It never logs request
+endpoint for SDK 2.x modern requests. The middleware emits `hermes_gpt.mcp_events`
+INFO records for each observed `server/discover`, `events/list`,
+`events/subscribe`, and `events/unsubscribe` request. Fields are UTC timestamp,
+method, detected protocol, detection source (`header`, `meta`, `header+meta`, or
+`none`), a bounded hashed string request ID (or safe numeric ID), outcome,
+logical/HTTP code, and elapsed milliseconds. The structured record is prefixed
+`mcp_events_rpc_json=` and its JSON object contains exactly those eight fields.
+A legacy key/value record remains for existing log readers. It never logs request
 parameters, credentials, callback URLs, principals, prompts, or result bodies.
 Non-modern calls are logged as they pass through to the MCP server; their
 outcome/code reflect the HTTP response only, not a decoded JSON-RPC body.

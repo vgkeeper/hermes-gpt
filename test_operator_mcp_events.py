@@ -262,7 +262,9 @@ def test_modern_events_rpc_logging_is_redacted(caplog, monkeypatch):
         async def downstream(*_args):
             raise AssertionError("modern event method should be intercepted")
         async def fake_dispatch(payload, _principal, _root):
-            return {"jsonrpc": "2.0", "id": payload["id"], "result": {"events": []}}
+            return {"jsonrpc": "2.0", "id": payload["id"],
+                    "result": {"events": [{"mission_id": "private-business-marker",
+                                             "payload": "private-result-marker"}]}}
         monkeypatch.setattr(ev, "dispatch", fake_dispatch)
         middleware = ev.EventsASGIMiddleware(downstream)
         request = json.dumps({"jsonrpc":"2.0", "id":"scan-17", "method":"events/list",
@@ -289,15 +291,41 @@ def test_modern_events_rpc_logging_is_redacted(caplog, monkeypatch):
     with caplog.at_level("INFO", logger="hermes_gpt.mcp_events"):
         asyncio.run(run())
     records = [r.message for r in caplog.records if "mcp_events_rpc" in r.message]
-    assert len(records) == 4
+    legacy_records = [record for record in records if record.startswith("mcp_events_rpc ")]
+    structured_records = [record for record in records if record.startswith("mcp_events_rpc_json=")]
+    assert len(legacy_records) == len(structured_records) == 4
     for method in ("server/discover", "events/list", "events/subscribe", "events/unsubscribe"):
-        assert any("method=" + method in record and "outcome=success" in record for record in records)
-    record = records[1]
+        assert any("method=" + method in record and "outcome=success" in record for record in legacy_records)
+    record = legacy_records[1]
     assert "protocol=2026-07-28" in record and "detection_source=header+meta" in record
     assert "request_id=rid_" in record
     assert "scan-17" not in record
-    for forbidden in ("private-bearer", "callback-secret", "private.invalid", "private prompt"):
-        assert all(forbidden not in record for record in records)
+    expected_keys = {
+        "timestamp", "method", "protocol", "detection_source", "request_id",
+        "outcome", "code", "duration_ms",
+    }
+    forbidden = (
+        "authorization", "bearer", "principal", "delivery.url", "delivery.secret",
+        "callback", "prompt", "params", "payload", "private-bearer",
+        "callback-secret", "private.invalid", "private prompt", "private-business-marker",
+        "private-result-marker", "scan-17",
+    )
+    for line in structured_records:
+        assert line.startswith("mcp_events_rpc_json=")
+        structured = json.loads(line.removeprefix("mcp_events_rpc_json="))
+        assert set(structured) == expected_keys
+        assert isinstance(structured["timestamp"], str) and structured["timestamp"].endswith("+00:00")
+        assert structured["method"] in {"server/discover", "events/list", "events/subscribe", "events/unsubscribe"}
+        assert structured["protocol"] == "2026-07-28"
+        assert structured["detection_source"] == "header+meta"
+        assert isinstance(structured["request_id"], (int, str))
+        assert structured["outcome"] == "success"
+        assert structured["code"] is None
+        assert isinstance(structured["duration_ms"], (int, float)) and structured["duration_ms"] >= 0
+        assert all(token not in line.lower() for token in forbidden)
+    event_list = json.loads(structured_records[1].removeprefix("mcp_events_rpc_json="))
+    assert event_list["request_id"].startswith("rid_")
+    assert len(event_list["request_id"]) == 20
 
 
 def test_middleware_streams_oversized_request_to_core_without_event_dispatch(monkeypatch):
