@@ -57,7 +57,17 @@ the last accepted event and is retried with bounded backoff. The journal remains
 the source of truth; the cursor is projection state, not proof of completion.
 
 The extension is intercepted only on the authenticated `/mcp` Streamable HTTP
-endpoint for SDK 2.x modern requests. SDK 1.x rejects
+endpoint for SDK 2.x modern requests. The middleware emits one structured
+`hermes_gpt.mcp_events` INFO record for each observed `server/discover`,
+`events/list`, `events/subscribe`, and `events/unsubscribe` request. Fields are
+UTC timestamp, method, detected protocol, detection source (`header`, `meta`,
+`header+meta`, or `none`), a bounded hashed string request ID (or safe numeric
+ID), outcome, logical/HTTP code, and elapsed milliseconds. It never logs request
+parameters, credentials, callback URLs, principals, prompts, or result bodies.
+Non-modern calls are logged as they pass through to the MCP server; their
+outcome/code reflect the HTTP response only, not a decoded JSON-RPC body.
+
+SDK 1.x rejects
 `MCP-Protocol-Version: 2026-07-28` before middleware can intercept it, so the
 real-HTTP modern Events test explicitly skips on SDK 1.x. Legacy initialize and
 `tools/list` continue on both SDK 1.x and 2.x. Stdio, SSE, legacy protocol

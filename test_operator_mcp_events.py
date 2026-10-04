@@ -196,6 +196,7 @@ def test_real_http_modern_events(monkeypatch, tmp_path):
         )
 
     import server
+    import versioning
 
     monkeypatch.setenv("HERMES_GPT_ENABLE_MCP", "1")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -205,11 +206,24 @@ def test_real_http_modern_events(monkeypatch, tmp_path):
         modern = {"Accept":"application/json, text/event-stream", "MCP-Protocol-Version":"2026-07-28"}
         discover = client.post("/mcp", headers=modern, json={"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}})
         assert discover.status_code == 200, discover.text
-        assert discover.json()["result"]["capabilities"]["events"] == {}
+        assert discover.headers["content-type"].startswith("application/json")
+        assert discover.json() == {
+            "jsonrpc": "2.0", "id": 1,
+            "result": {
+                "resultType": "complete", "supportedVersions": [ev.PROTOCOL],
+                "capabilities": {"tools": {}, "events": {}},
+                "_meta": {"io.modelcontextprotocol/serverInfo": {
+                    "name": "hermes-gpt", "version": versioning.VERSION
+                }},
+            },
+        }
         listing = client.post("/mcp", headers=modern, json={"jsonrpc":"2.0","id":2,"method":"events/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}})
-        assert listing.json()["result"]["events"][0]["name"] == ev.EVENT_NAME
+        assert listing.status_code == 200
+        assert listing.headers["content-type"].startswith("application/json")
+        assert listing.json()["result"]["events"][0] == ev._event_list()["events"][0]
         tools = client.post("/mcp", headers={**modern,"MCP-Method":"tools/list"}, json={"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}})
         assert tools.status_code == 200
+        assert tools.headers["content-type"].startswith("application/json")
         assert tools.json()["result"]["tools"]
 
 
@@ -240,6 +254,50 @@ def test_real_http_legacy_tools_compat(monkeypatch, tmp_path):
         })
         assert events.status_code == 200
         assert "result" not in events.json()
+
+
+
+def test_modern_events_rpc_logging_is_redacted(caplog, monkeypatch):
+    async def run():
+        async def downstream(*_args):
+            raise AssertionError("modern event method should be intercepted")
+        async def fake_dispatch(payload, _principal, _root):
+            return {"jsonrpc": "2.0", "id": payload["id"], "result": {"events": []}}
+        monkeypatch.setattr(ev, "dispatch", fake_dispatch)
+        middleware = ev.EventsASGIMiddleware(downstream)
+        request = json.dumps({"jsonrpc":"2.0", "id":"scan-17", "method":"events/list",
+                              "params":{"_meta":{"io.modelcontextprotocol/protocolVersion":ev.PROTOCOL},
+                                        "delivery":{"url":"https://private.invalid/callback", "secret":"callback-secret"},
+                                        "prompt":"private prompt"}}).encode()
+        sent = []
+        messages = [{"type":"http.request", "body":request, "more_body":False}]
+        async def receive(): return messages.pop(0)
+        async def send(message): sent.append(message)
+        scope={"type":"http", "method":"POST", "path":"/mcp", "headers":[
+            (b"mcp-protocol-version", ev.PROTOCOL.encode()),
+            (b"authorization", b"Bearer private-bearer") ]}
+        await middleware(scope, receive, send)
+        assert sent[0]["status"] == 200
+        assert dict(sent[0]["headers"])[b"content-type"] == b"application/json"
+        for method in ("server/discover", "events/subscribe", "events/unsubscribe"):
+            messages.append({"type":"http.request", "body":json.dumps({
+                "jsonrpc":"2.0", "id":method, "method":method,
+                "params":{"_meta":{"io.modelcontextprotocol/protocolVersion":ev.PROTOCOL},
+                          "delivery":{"url":"https://private.invalid/callback", "secret":"callback-secret"},
+                          "prompt":"private prompt"}}).encode(), "more_body":False})
+            await middleware(scope, receive, send)
+    with caplog.at_level("INFO", logger="hermes_gpt.mcp_events"):
+        asyncio.run(run())
+    records = [r.message for r in caplog.records if "mcp_events_rpc" in r.message]
+    assert len(records) == 4
+    for method in ("server/discover", "events/list", "events/subscribe", "events/unsubscribe"):
+        assert any("method=" + method in record and "outcome=success" in record for record in records)
+    record = records[1]
+    assert "protocol=2026-07-28" in record and "detection_source=header+meta" in record
+    assert "request_id=rid_" in record
+    assert "scan-17" not in record
+    for forbidden in ("private-bearer", "callback-secret", "private.invalid", "private prompt"):
+        assert all(forbidden not in record for record in records)
 
 
 def test_middleware_streams_oversized_request_to_core_without_event_dispatch(monkeypatch):
