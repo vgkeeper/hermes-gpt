@@ -688,8 +688,23 @@ def _safe_request_id(value: Any) -> str | int | None:
 
 def _log_events_rpc(method: str, protocol: str, source: str, request_id: Any,
                     outcome: str, code: Any, started: float) -> None:
+    timestamp = datetime.now(timezone.utc).isoformat()
+    duration_ms = round(max(0.0, (time.perf_counter() - started) * 1000), 3)
+    safe_code = code if isinstance(code, int) and not isinstance(code, bool) else None
+    safe_request_id = _safe_request_id(request_id)
+    if safe_request_id is None:
+        safe_request_id = "-"
     _LOG.info("mcp_events_rpc timestamp=%s method=%s protocol=%s detection_source=%s request_id=%s outcome=%s code=%s duration_ms=%.3f",
-              datetime.now(timezone.utc).isoformat(), method, protocol[:32], source,
-              request_id if request_id is not None else "-", outcome,
-              code if isinstance(code, int) and not isinstance(code, bool) else "-",
-              max(0.0, (time.perf_counter() - started) * 1000))
+              timestamp, method, protocol[:32], source, safe_request_id, outcome,
+              safe_code if safe_code is not None else "-", duration_ms)
+    record = {
+        "timestamp": timestamp,
+        "method": method,
+        "protocol": protocol[:32],
+        "detection_source": source,
+        "request_id": safe_request_id,
+        "outcome": outcome,
+        "code": safe_code,
+        "duration_ms": duration_ms,
+    }
+    _LOG.info("mcp_events_rpc_json=%s", json.dumps(record, separators=(",", ":"), allow_nan=False))
