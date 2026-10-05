@@ -69,6 +69,19 @@ parameters, credentials, callback URLs, principals, prompts, or result bodies.
 Non-modern calls are logged as they pass through to the MCP server; their
 outcome/code reflect the HTTP response only, not a decoded JSON-RPC body.
 
+A second, generic `mcp_rpc_trace_json=` record is emitted by the outer HTTP MCP
+entry middleware before routing and before the Events middleware. It records all
+JSON-RPC methods received at `/mcp`, including core methods and notifications,
+not only Events calls. Its strict JSON allowlist is `timestamp`, `http_path`,
+`rpc_method`, `protocol_version`, `detection_source`, `request_id`,
+`http_status`, `rpc_error_code`, `outcome`, and `duration_ms`. String request IDs
+are one-way hashed; numeric JSON-RPC IDs remain numeric when safely bounded.
+Only the protocol header or the standard protocol-version metadata/initialize
+field is inspected. Request bodies and response bodies are never logged; bounded
+in-memory inspection is used only to extract method, protocol version, ID, and an
+integer JSON-RPC error code. Non-`/mcp` HTTP routes and non-HTTP transports are
+not included.
+
 SDK 1.x rejects
 `MCP-Protocol-Version: 2026-07-28` before middleware can intercept it, so the
 real-HTTP modern Events test explicitly skips on SDK 1.x. Legacy initialize and

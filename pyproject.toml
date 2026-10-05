@@ -90,6 +90,7 @@ py-modules = [
   "codex_mcp",
   "mcp_compat",
   "operator_mcp_events",
+  "mcp_rpc_trace",
   "codex_config",
   "seams",
   "updater",

@@ -3315,6 +3315,8 @@ def build_asgi_app(server: FastMCP, *, http: bool) -> Any:
     )
     routes.append(Mount("/", app=mcp_app))
     app = Starlette(routes=routes, lifespan=raw_mcp_app.router.lifespan_context)
+    from mcp_rpc_trace import MCPRPCTraceASGIMiddleware
+    app.add_middleware(MCPRPCTraceASGIMiddleware)
     issuer = oauth_state.config.issuer if oauth_state is not None else ""
     parsed_issuer = urllib.parse.urlparse(issuer)
     issuer_origin = f"{parsed_issuer.scheme}://{parsed_issuer.netloc}" if parsed_issuer.netloc else ""
