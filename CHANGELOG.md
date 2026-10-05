@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Added bounded, allowlisted `mcp_rpc_trace_json=` metadata logs at the authenticated `/mcp` HTTP entry point, before routing and MCP Events middleware. All JSON-RPC methods and notifications are traced with protocol/source, hashed or safe request ID, HTTP/RPC outcome, and duration; request and response bodies, params, credentials, and business data are never logged. When INFO logging is filtered, the structured trace falls back to stderr so container logs retain it.
+- Added bounded, allowlisted `mcp_rpc_trace_json=` metadata logs at the authenticated `/mcp` HTTP entry point, before routing and MCP Events middleware. All JSON-RPC methods and notifications are traced with protocol/source, hashed or safe request ID, HTTP/RPC outcome, and duration; request and response bodies, params, credentials, and business data are never logged. Structured trace lines are written directly to stderr, independent of runtime logger filters, so container logs retain them.
 
 - Added optional `mission_id` association to asynchronous session-create/continue jobs. The worker persists it and publishes an idempotent `session/job.terminal` Live Event only after durable terminal status; event payloads exclude prompts and output, and job status/result semantics remain unchanged.
 

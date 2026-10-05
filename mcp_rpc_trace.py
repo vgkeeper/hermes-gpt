@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import re
 import sys
 import time
 from datetime import datetime, timezone
 from typing import Any
 
-_LOG = logging.getLogger("hermes_gpt.mcp_rpc_trace")
 _PREFIX = "mcp_rpc_trace_json="
 _MAX_REQUEST_BYTES = 256 * 1024
 _MAX_RESPONSE_BYTES = 64 * 1024
@@ -208,9 +206,4 @@ class MCPRPCTraceASGIMiddleware:
                     "duration_ms": duration_ms,
                 }
                 line = _PREFIX + json.dumps(record, separators=(",", ":"), allow_nan=False)
-                if _LOG.isEnabledFor(logging.INFO):
-                    _LOG.info("%s", line)
-                else:
-                    # Uvicorn configures its own logger, not the root logger. Keep
-                    # structured traces visible in container stderr when INFO is filtered.
-                    print(line, file=sys.stderr, flush=True)
+                print(line, file=sys.stderr, flush=True)
