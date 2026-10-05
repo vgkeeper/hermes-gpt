@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -206,4 +207,10 @@ class MCPRPCTraceASGIMiddleware:
                     "outcome": outcome,
                     "duration_ms": duration_ms,
                 }
-                _LOG.info("%s%s", _PREFIX, json.dumps(record, separators=(",", ":"), allow_nan=False))
+                line = _PREFIX + json.dumps(record, separators=(",", ":"), allow_nan=False)
+                if _LOG.isEnabledFor(logging.INFO):
+                    _LOG.info("%s", line)
+                else:
+                    # Uvicorn configures its own logger, not the root logger. Keep
+                    # structured traces visible in container stderr when INFO is filtered.
+                    print(line, file=sys.stderr, flush=True)
