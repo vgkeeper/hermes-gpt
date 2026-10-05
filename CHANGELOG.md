@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added bounded, allowlisted `mcp_rpc_trace_json=` metadata logs at the authenticated `/mcp` HTTP entry point, before routing and MCP Events middleware. All JSON-RPC methods and notifications are traced with protocol/source, hashed or safe request ID, HTTP/RPC outcome, and duration; request and response bodies, params, credentials, and business data are never logged.
+
 - Added optional `mission_id` association to asynchronous session-create/continue jobs. The worker persists it and publishes an idempotent `session/job.terminal` Live Event only after durable terminal status; event payloads exclude prompts and output, and job status/result semantics remain unchanged.
 
 - Added four narrow authenticated Hermes Work Bridge adapter tools (register/update/get/cancel) to the Hermes Pilote MCP. The bridge remains a separate service/repository; this module only calls its fixed API and never implements monitoring or Slack delivery. The adapter can read its bearer credential from an explicitly mounted token file (`HERMES_WORK_BRIDGE_TOKEN_FILE`) so the secret is scoped to the Pilote runtime. Setup and Work/Sheet protocol: `docs/work-bridge.md`.
