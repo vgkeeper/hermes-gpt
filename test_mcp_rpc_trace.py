@@ -94,6 +94,25 @@ def test_trace_is_structured_allowlisted_and_redacted(caplog):
             assert secret not in line.lower()
 
 
+def test_trace_falls_back_to_stderr_when_info_is_filtered(capsys):
+    logger = logging.getLogger("hermes_gpt.mcp_rpc_trace")
+    previous_level = logger.level
+    logger.setLevel(logging.WARNING)
+    try:
+        _run_request({"jsonrpc": "2.0", "id": 1, "method": "server/discover"})
+    finally:
+        logger.setLevel(previous_level)
+
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith(PREFIX)
+    record = json.loads(lines[0][len(PREFIX):])
+    assert set(record) == EXPECTED_KEYS
+    assert record["rpc_method"] == "server/discover"
+    assert record["http_status"] == 200
+    assert "private-bearer" not in lines[0]
+
+
 def test_non_mcp_path_is_passed_through_without_trace(caplog):
     called = []
 
