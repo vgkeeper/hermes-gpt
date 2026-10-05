@@ -186,7 +186,7 @@ def test_events_rpc_and_modern_only_passthrough():
     asyncio.run(run())
 
 
-def test_real_http_modern_events(monkeypatch, tmp_path, caplog):
+def test_real_http_modern_events(monkeypatch, tmp_path, capsys):
     from mcp_compat import SDK_V2
 
     if not SDK_V2:
@@ -198,7 +198,6 @@ def test_real_http_modern_events(monkeypatch, tmp_path, caplog):
     import server
     import versioning
 
-    caplog.set_level("INFO", logger="hermes_gpt.mcp_rpc_trace")
     monkeypatch.setenv("HERMES_GPT_ENABLE_MCP", "1")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     built = server.build_server(http=True)
@@ -227,9 +226,9 @@ def test_real_http_modern_events(monkeypatch, tmp_path, caplog):
         assert tools.headers["content-type"].startswith("application/json")
         assert tools.json()["result"]["tools"]
     traces = [
-        json.loads(record.message.removeprefix("mcp_rpc_trace_json="))
-        for record in caplog.records
-        if record.message.startswith("mcp_rpc_trace_json=")
+        json.loads(line.removeprefix("mcp_rpc_trace_json="))
+        for line in capsys.readouterr().err.splitlines()
+        if line.startswith("mcp_rpc_trace_json=")
     ]
     assert [record["rpc_method"] for record in traces] == [
         "server/discover", "events/list", "tools/list"

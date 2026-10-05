@@ -1,6 +1,5 @@
 import asyncio
 import json
-import logging
 
 from mcp_rpc_trace import MCPRPCTraceASGIMiddleware
 
@@ -43,7 +42,7 @@ def _run_request(payload, headers=()):
     return sent
 
 
-def test_trace_is_structured_allowlisted_and_redacted(caplog):
+def test_trace_is_structured_allowlisted_and_redacted(capsys):
     requests = [
         ({"jsonrpc": "2.0", "id": "host-scan-private", "method": "initialize",
           "params": {"protocolVersion": "2025-11-25", "prompt": "private prompt"}}, [], "initialize", "meta"),
@@ -58,12 +57,10 @@ def test_trace_is_structured_allowlisted_and_redacted(caplog):
         ({"jsonrpc": "2.0", "id": 6, "method": "events/unsubscribe", "params": {}}, [], "events/unsubscribe", "none"),
         ({"jsonrpc": "2.0", "id": 7, "method": "custom/future_method", "params": {"payload": "private"}}, [], "custom/future_method", "none"),
     ]
-    logger = logging.getLogger("hermes_gpt.mcp_rpc_trace")
-    with caplog.at_level(logging.INFO, logger=logger.name):
-        for payload, headers, _method, _source in requests:
-            sent = _run_request(payload, headers)
-            assert sent[0]["status"] == 200
-    lines = [record.message for record in caplog.records if record.message.startswith(PREFIX)]
+    for payload, headers, _method, _source in requests:
+        sent = _run_request(payload, headers)
+        assert sent[0]["status"] == 200
+    lines = [line for line in capsys.readouterr().err.splitlines() if line.startswith(PREFIX)]
     assert len(lines) == len(requests)
     for line, (payload, headers, method, source) in zip(lines, requests):
         record = json.loads(line.removeprefix(PREFIX))
@@ -94,14 +91,8 @@ def test_trace_is_structured_allowlisted_and_redacted(caplog):
             assert secret not in line.lower()
 
 
-def test_trace_falls_back_to_stderr_when_info_is_filtered(capsys):
-    logger = logging.getLogger("hermes_gpt.mcp_rpc_trace")
-    previous_level = logger.level
-    logger.setLevel(logging.WARNING)
-    try:
-        _run_request({"jsonrpc": "2.0", "id": 1, "method": "server/discover"})
-    finally:
-        logger.setLevel(previous_level)
+def test_trace_is_written_directly_to_stderr(capsys):
+    _run_request({"jsonrpc": "2.0", "id": 1, "method": "server/discover"})
 
     lines = capsys.readouterr().err.splitlines()
     assert len(lines) == 1
@@ -113,7 +104,7 @@ def test_trace_falls_back_to_stderr_when_info_is_filtered(capsys):
     assert "private-bearer" not in lines[0]
 
 
-def test_non_mcp_path_is_passed_through_without_trace(caplog):
+def test_non_mcp_path_is_passed_through_without_trace(capsys):
     called = []
 
     async def app(scope, receive, send):
@@ -125,13 +116,12 @@ def test_non_mcp_path_is_passed_through_without_trace(caplog):
     async def send(_message):
         pass
 
-    with caplog.at_level(logging.INFO, logger="hermes_gpt.mcp_rpc_trace"):
-        asyncio.run(MCPRPCTraceASGIMiddleware(app)(scope, receive, send))
+    asyncio.run(MCPRPCTraceASGIMiddleware(app)(scope, receive, send))
     assert called == ["/oauth/token"]
-    assert not any(record.message.startswith(PREFIX) for record in caplog.records)
+    assert not any(line.startswith(PREFIX) for line in capsys.readouterr().err.splitlines())
 
 
-def test_rpc_trace_handles_http_errors_and_non_jsonrpc_bodies(caplog):
+def test_rpc_trace_handles_http_errors_and_non_jsonrpc_bodies(capsys):
     payload = {"jsonrpc": "2.0", "id": "error-id", "method": "other/method", "params": {}}
     request = json.dumps(payload).encode()
     messages = [{"type": "http.request", "body": request, "more_body": False}]
@@ -142,9 +132,8 @@ def test_rpc_trace_handles_http_errors_and_non_jsonrpc_bodies(caplog):
         await send({"type": "http.response.body", "body": b"private error response", "more_body": False})
     async def send(_message): pass
     scope = {"type": "http", "method": "POST", "path": "/mcp", "headers": []}
-    with caplog.at_level(logging.INFO, logger="hermes_gpt.mcp_rpc_trace"):
-        asyncio.run(MCPRPCTraceASGIMiddleware(app)(scope, receive, send))
-    lines = [r.message for r in caplog.records if r.message.startswith(PREFIX)]
+    asyncio.run(MCPRPCTraceASGIMiddleware(app)(scope, receive, send))
+    lines = [line for line in capsys.readouterr().err.splitlines() if line.startswith(PREFIX)]
     assert len(lines) == 1
     record = json.loads(lines[0][len(PREFIX):])
     assert record["rpc_method"] == "other/method"
