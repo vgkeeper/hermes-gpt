@@ -52,6 +52,68 @@ def _enable_owner(monkeypatch, *, ack=True, direct=True):
         monkeypatch.setenv(op.OWNER_ACK_ENV, op.OWNER_ACK_REQUIRED_VALUE)
 
 
+def test_telegram_notify_dry_run_resolves_persistent_destination_without_leaking_it(tmp_path, clean_env, audit_override, monkeypatch):
+    root = tmp_path / "hermes"
+    root.mkdir()
+    (root / ".env").write_text(
+        "TELEGRAM_HOME_CHANNEL=-1001234567890\nTELEGRAM_HOME_CHANNEL_THREAD_ID=19314\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "workspace")
+    out = json.loads(ows.hermes_telegram_notify(
+        "TERMINÉ", "test message", hermes_root=root,
+    ))
+    assert out["success"] and out["dry_run"]
+    assert "-1001234567890" not in json.dumps(out)
+    record = json.loads(audit_override.read_text(encoding="utf-8").splitlines()[-1])
+    assert record["summary"].startswith("status=TERMINÉ; length=12; trace_id=")
+    assert "test message" not in json.dumps(record)
+
+
+def test_telegram_notify_requires_gates_and_redacts_error(clean_env, audit_override, monkeypatch):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "workspace")
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-1001234567890")
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL_THREAD_ID", "19314")
+    out = json.loads(ows.hermes_telegram_notify(
+        "TERMINÉ", "private body", dry_run=False, confirm=False,
+    ))
+    assert out["success"] is False
+    assert "private body" not in json.dumps(out)
+    assert "-1001234567890" not in json.dumps(out)
+
+
+def test_telegram_notify_real_send_uses_fixed_argv_and_gates(clean_env, audit_override, monkeypatch):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "workspace")
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-1001234567890")
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL_THREAD_ID", "19314")
+    calls = []
+    def runner(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return 0, "", ""
+    out = json.loads(ows.hermes_telegram_notify(
+        "TIMEOUT", "bounded", confirm=True, dry_run=False, runner=runner,
+    ))
+    assert out["success"] is True
+    assert calls[0][0][1:4] == ["send", "--to", "telegram:-1001234567890:19314"]
+    assert calls[0][1]["timeout"] == 20
+
+
+def test_telegram_notify_rejects_invalid_status_and_oversized_payload(clean_env, audit_override, monkeypatch):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "workspace")
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-1001234567890")
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL_THREAD_ID", "19314")
+    for status, message in (("DONE", "x"), ("TERMINÉ", "x" * 1001)):
+        out = json.loads(ows.hermes_telegram_notify(status, message))
+        assert out["success"] is False
+
+
+
 # --- workspace read ------------------------------------------------------
 
 
@@ -593,6 +655,7 @@ def test_tool_registration_includes_new_operator_tools(monkeypatch):
         "hermes_env_copy_nonsecret",
         "hermes_gateway_status",
         "hermes_gateway_restart",
+        "hermes_telegram_notify",
         "hermes_workspace_read",
         "hermes_workspace_patch",
         "hermes_workspace_write_file",

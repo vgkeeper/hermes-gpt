@@ -2255,6 +2255,15 @@ def hermes_env_copy_nonsecret(source_profile: str, target_profile: str, key: str
 # --- Gateway / workspace / git / owner wrappers --------------------------
 
 
+def hermes_telegram_notify(
+    status: str, message: str, confirm: bool = False, dry_run: bool = True,
+) -> str:
+    return op_workspace.hermes_telegram_notify(
+        status=status, message=message, confirm=confirm, dry_run=dry_run,
+        hermes_root=_default_hermes_root(),
+    )
+
+
 def hermes_gateway_status(profile: str = "default") -> str:
     return op_workspace.hermes_gateway_status(
         profile=profile, hermes_root=_default_hermes_root(),
@@ -3802,6 +3811,7 @@ def register_tools(server: FastMCP) -> None:
 
     # Gateway / workspace / git / owner
     server.add_tool(hermes_gateway_status, meta=tool_meta())
+    server.add_tool(hermes_telegram_notify, meta=tool_meta())
     server.add_tool(hermes_gateway_restart, meta=tool_meta())
     server.add_tool(hermes_workspace_read, meta=tool_meta())
     server.add_tool(

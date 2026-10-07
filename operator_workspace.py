@@ -87,6 +87,91 @@ def _split_command_argv(command: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Telegram terminal notifications
+# ---------------------------------------------------------------------------
+
+
+def _telegram_home_config(hermes_root: Path | None) -> tuple[str, str]:
+    """Resolve the configured Telegram home chat/thread without exposing them."""
+    values = {
+        "TELEGRAM_HOME_CHANNEL": os.environ.get("TELEGRAM_HOME_CHANNEL", "").strip(),
+        "TELEGRAM_HOME_CHANNEL_THREAD_ID": os.environ.get("TELEGRAM_HOME_CHANNEL_THREAD_ID", "").strip(),
+    }
+    missing = {key for key, value in values.items() if not value}
+    if missing and hermes_root is not None:
+        env_file = op.resolve_profile_home("default", hermes_root) / ".env"
+        try:
+            for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if key in missing:
+                    values[key] = value.strip().strip("\"'")
+        except OSError:
+            pass
+    channel = values["TELEGRAM_HOME_CHANNEL"]
+    thread = values["TELEGRAM_HOME_CHANNEL_THREAD_ID"]
+    if not re.fullmatch(r"-?\d+", channel) or not re.fullmatch(r"[1-9]\d*", thread):
+        raise ValueError("Telegram home destination is not configured")
+    return channel, thread
+
+
+def hermes_telegram_notify(
+    status: str,
+    message: str,
+    confirm: bool = False,
+    dry_run: bool = True,
+    hermes_root: Path | None = None,
+    runner=None,
+) -> str:
+    """Send one bounded terminal status to the persistent Telegram home thread."""
+    trace_id = op.new_trace_id()
+    policy = op.OperatorPolicy()
+    length = len(message) if isinstance(message, str) else 0
+    effective_dry_run = policy.effective_dry_run(dry_run)
+    try:
+        policy.require_level("workspace")
+        if not isinstance(status, str) or status not in {"TERMINÉ", "BLOQUÉ", "TIMEOUT"}:
+            raise ValueError("Unsupported terminal status")
+        if not isinstance(message, str) or not message.strip() or len(f"{status} — {message}") > 1000:
+            raise ValueError("Message must contain 1 to 1000 characters including status")
+        channel, thread = _telegram_home_config(hermes_root)
+        destination = f"telegram:{channel}:{thread}"
+        argv = [_hermes_cli(), "send", "--to", destination, f"{status} — {message}", "--json"]
+        if effective_dry_run:
+            op.audit_record(
+                tool="hermes_telegram_notify", level=policy.level, apply_mode=policy.apply_mode,
+                dry_run=True, success=True, changed=False,
+                summary=f"status={status}; length={length}; trace_id={trace_id}",
+                extra={"status": status, "length": length, "trace_id": trace_id},
+            )
+            return json.dumps({"success": True, "dry_run": True, "status": status, "length": length, "trace_id": trace_id}, indent=2)
+        if not confirm or policy.apply_mode != "direct":
+            raise PermissionError("Real send requires confirm=true and direct apply mode")
+        rc, _, _ = (runner or op.run_argv)(argv, timeout=20, workdir=None, env=None, max_output_chars=1024)
+        success = rc == 0
+        op.audit_record(
+            tool="hermes_telegram_notify", level=policy.level, apply_mode=policy.apply_mode,
+            dry_run=False, success=success, changed=success,
+            summary=f"status={status}; length={length}; trace_id={trace_id}",
+            error="delivery failed" if not success else "",
+            extra={"status": status, "length": length, "trace_id": trace_id},
+        )
+        return json.dumps({"success": success, "dry_run": False, "status": status, "length": length, "trace_id": trace_id, "error": None if success else "Telegram delivery failed"}, indent=2)
+    except Exception as exc:
+        safe_error = "Telegram notification refused or failed"
+        op.audit_record(
+            tool="hermes_telegram_notify", level=policy.level, apply_mode=policy.apply_mode,
+            dry_run=effective_dry_run, success=False, changed=False,
+            summary=f"status={status if isinstance(status, str) and status in {'TERMINÉ', 'BLOQUÉ', 'TIMEOUT'} else 'invalid'}; length={length}; trace_id={trace_id}",
+            error=safe_error, extra={"status": status if isinstance(status, str) and status in {"TERMINÉ", "BLOQUÉ", "TIMEOUT"} else "invalid", "length": length, "trace_id": trace_id},
+        )
+        return json.dumps({"success": False, "dry_run": effective_dry_run, "error": safe_error, "trace_id": trace_id}, indent=2)
+
+
+# ---------------------------------------------------------------------------
 # Gateway
 # ---------------------------------------------------------------------------
 

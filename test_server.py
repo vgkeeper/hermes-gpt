@@ -1679,8 +1679,8 @@ V09_CONNECTOR_ADDITIONS = [
 # + 4 mission-budget envelope tools (sibling t_78e597c6) + 4 placement-scoring
 # tools (sibling t_167ac591) + 4 failure-semantics tools (t_49bbc143) + 4
 # + 4 supervised-mission-controller tools (t_ad1e6d07) + 4 Hermes Work
-# bridge-adapter tools (register/update/get/cancel).
-V09_CONNECTOR_TOOL_COUNT = 141
+# bridge-adapter tools (register/update/get/cancel) + 1 workspace Telegram notify tool.
+V09_CONNECTOR_TOOL_COUNT = 142
 
 
 def test_v09_connector_surface_acceptance(monkeypatch):
@@ -1721,7 +1721,7 @@ def test_history_enabled_connector_surface_acceptance(monkeypatch):
         "hermes_bot_chat_get",
     }
 
-    assert len(enabled_names) == len(set(enabled_names)) == 146
+    assert len(enabled_names) == len(set(enabled_names)) == 147
     assert set(enabled_names) - set(disabled_names) == expected_history_tools
     assert set(disabled_names) - set(enabled_names) == set()
 
