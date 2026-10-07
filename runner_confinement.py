@@ -431,7 +431,12 @@ def confine_path(base: Path, candidate: str | Path) -> Path:
     return candidate_resolved
 
 
-def validate_workspace_boundary(workspace: Path) -> Path:
+def validate_workspace_boundary(
+    workspace: Path,
+    *,
+    reject_symlinks: bool = False,
+    reject_hardlinks: bool = False,
+) -> Path:
     """Fail closed on workspace aliases that can bypass path/mount isolation.
 
     A pre-existing hard link inside the workspace can reference the same inode
@@ -475,6 +480,8 @@ def validate_workspace_boundary(workspace: Path) -> Path:
                 path = current_path / name
                 entry_stat = path.lstat()
                 if stat.S_ISLNK(entry_stat.st_mode):
+                    if reject_symlinks:
+                        raise PermissionError(f"confined workspace contains a symlink: {path}")
                     try:
                         target = path.resolve(strict=False)
                     except OSError as exc:
@@ -497,9 +504,9 @@ def validate_workspace_boundary(workspace: Path) -> Path:
         raise PermissionError(f"unable to validate confined workspace boundary: {root}") from exc
 
     for key, count in inode_counts.items():
-        if inode_nlinks[key] > count:
+        if inode_nlinks[key] > count or (reject_hardlinks and inode_nlinks[key] > 1):
             raise PermissionError(
-                f"confined workspace contains a hard link with an alias outside the workspace: {inode_sample[key]}"
+                f"confined workspace contains a hard link alias outside or within the workspace: {inode_sample[key]}"
             )
     return root
 

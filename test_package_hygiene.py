@@ -244,6 +244,22 @@ def test_sdist_does_not_ship_internal_docs(built_artifacts):
     assert any("docs/mcp-compatibility.md" in n for n in names), "sdist missing public MCP compatibility manifest"
 
 
+def test_distribution_artifacts_exclude_opencode_deployment_templates(built_artifacts):
+    assert (REPO_ROOT / "deploy" / "opencode" / "docker-compose.yml").is_file()
+    for artifact in built_artifacts:
+        if artifact.name.endswith(".whl"):
+            with zipfile.ZipFile(artifact) as archive:
+                names = archive.namelist()
+        else:
+            with tarfile.open(artifact, "r:gz") as archive:
+                names = archive.getnames()
+        assert not any("/deploy/opencode/" in f"/{name}" for name in names), (
+            f"{artifact.name} includes deploy/opencode templates"
+        )
+
+
+
+
 def test_wheel_contains_public_docs_and_all_py_modules(built_artifacts):
     """Proof 10: wheel ships current public docs and every declared top-level module."""
     try:

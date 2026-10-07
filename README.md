@@ -47,7 +47,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the complete v0.12.0 change list.
 
 ### Fork additions over upstream v0.13.0
 
-This integration branch preserves the four authenticated Pilote adapter tools and Work Bridge guidance; the bridge service remains in its own repository ([docs/work-bridge.md](docs/work-bridge.md)). It projects durable Live Events to OpenAI MCP Events as wake-up notifications, not completion proof ([MCP compatibility](docs/mcp-compatibility.md#openai-mcp-events-extension)). Coding Work Contracts can explicitly select the `openhands` runner; missing auth, timeouts, and unsupported results fail closed. These are source-branch changes, not a new release or distribution claim.
+This integration branch preserves the four authenticated Pilote adapter tools and Work Bridge guidance; the bridge service remains in its own repository ([docs/work-bridge.md](docs/work-bridge.md)). It projects durable Live Events to OpenAI MCP Events as wake-up notifications, not completion proof ([MCP compatibility](docs/mcp-compatibility.md#openai-mcp-events-extension)). Coding Work Contracts can explicitly select the `openhands` runner; missing auth, timeouts, and unsupported results fail closed. The native `opencode` runner also has an opt-in, read-only `run --attach` mode behind a private authenticated Nginx sidecar and a strict shared-workspace mapping; it does not alter local OpenCode behavior or deploy anything ([Operator Mode](docs/operator-mode.md#opencode-remote-attach-read-only-only), templates in [`deploy/opencode/`](deploy/opencode/)). These are source-branch changes, not a new release or distribution claim.
 
 ## What v0.11.0 adds
 
