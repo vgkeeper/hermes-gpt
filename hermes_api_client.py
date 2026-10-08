@@ -109,6 +109,12 @@ class HermesAPIClient:
             raise HermesAPIError("invalid_input")
         return value
 
+    @staticmethod
+    def _validate_pagination(value: int, maximum: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+            raise HermesAPIError("invalid_input")
+        return value
+
     @classmethod
     def _route(cls, path: str, profile: str) -> str:
         profile = cls._validate_profile(profile)
@@ -341,8 +347,68 @@ class HermesAPIClient:
         except (http.client.HTTPException, OSError, ValueError):
             raise HermesAPIError("network_error") from None
 
+    def list_sessions(
+        self,
+        limit: int = 20,
+        offset: int = 0,
+        include_archived: bool = False,
+        profile: str = "default",
+    ) -> dict[str, Any]:
+        """Return a bounded page from ``GET /api/sessions``."""
+        limit = self._validate_pagination(limit, 100)
+        offset = self._validate_pagination(offset, 10_000)
+        if not isinstance(include_archived, bool):
+            raise HermesAPIError("invalid_input")
+        query = urllib.parse.urlencode({
+            "limit": limit,
+            "offset": offset,
+            "archived": "include" if include_archived else "exclude",
+        })
+        result = self._request_json("GET", self._route(f"/api/sessions?{query}", profile))
+        sessions = result.get("sessions")
+        if (
+            not isinstance(sessions, list)
+            or len(sessions) > limit
+            or any(not isinstance(row, dict) for row in sessions)
+        ):
+            raise HermesAPIError("invalid_response")
+        return result
+
     def get_session(self, session_id: str, profile: str = "default") -> dict[str, Any]:
         """Return a session from ``GET /api/sessions/{session_id}``."""
         session_id = self._validate_id(session_id)
         path_id = urllib.parse.quote(session_id, safe="")
         return self._request_json("GET", self._route(f"/api/sessions/{path_id}", profile))
+
+    def get_session_messages(
+        self,
+        session_id: str,
+        limit: int = 100,
+        offset: int = 0,
+        include_inactive: bool = False,
+        profile: str = "default",
+    ) -> dict[str, Any]:
+        """Return a chronological page from ``GET /api/sessions/{id}/messages``."""
+        session_id = self._validate_id(session_id)
+        limit = self._validate_pagination(limit, 500)
+        offset = self._validate_pagination(offset, 10_000)
+        if not isinstance(include_inactive, bool):
+            raise HermesAPIError("invalid_input")
+        path_id = urllib.parse.quote(session_id, safe="")
+        query = urllib.parse.urlencode({
+            "limit": limit,
+            "offset": offset,
+            "order": "oldest",
+            "include_compacted": str(include_inactive).lower(),
+        })
+        result = self._request_json(
+            "GET", self._route(f"/api/sessions/{path_id}/messages?{query}", profile)
+        )
+        messages = result.get("messages")
+        if (
+            not isinstance(messages, list)
+            or len(messages) > limit
+            or any(not isinstance(row, dict) for row in messages)
+        ):
+            raise HermesAPIError("invalid_response")
+        return result

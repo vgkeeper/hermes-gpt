@@ -86,6 +86,7 @@ MAX_ID_LENGTH = 256
 MAX_QUERY_LENGTH = 512
 MAX_RESPONSE_BYTES = 262_144
 MAX_MESSAGE_SCAN_ROWS = 1_000
+MAX_SESSION_API_SCAN_ROWS = 10_000
 DEFAULT_SESSION_OFFSET = 0
 DEFAULT_SESSION_MAX_RUNTIME_SECONDS = 7_200
 _TOOL_ERRORS = (ImportError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error)
@@ -1066,11 +1067,10 @@ def hermes_session_list(
     offset: int = DEFAULT_SESSION_OFFSET,
     include_archived: bool = False,
     profile: str = "default",
+    title: str | None = None,
 ) -> str:
     safe_profile = _validate_session_profile(profile)
-    adapter = ReadOnlySessionAdapter(profile=safe_profile)
     try:
-        require_imports()
         if not env_enabled(ENABLE_SESSION_SEARCH_ENV):
             return _session_error(
                 "SESSION_HISTORY_DISABLED",
@@ -1079,28 +1079,84 @@ def hermes_session_list(
         safe_limit = _validate_limit(limit, "limit", MAX_LIST_LIMIT)
         safe_offset = _validate_offset(offset)
         safe_include_archived = _validate_bool(include_archived, "include_archived")
-        adapter.open()
-        rows = adapter.list_sessions(
-            limit=safe_limit,
-            offset=safe_offset,
-            include_archived=safe_include_archived,
+        if title is not None and not isinstance(title, str):
+            raise TypeError("title must be a string.")
+        safe_title = _validate_query(title) if title is not None and title.strip() else None
+
+        client = HermesAPIClient()
+        selected: list[dict[str, Any]] = []
+        scanned = 0
+        api_offset = 0 if safe_title is not None else safe_offset
+        matched_count = 0
+        source_exhausted = safe_limit == 0
+        while (
+            not source_exhausted
+            and scanned < MAX_SESSION_API_SCAN_ROWS
+            and len(selected) <= safe_limit
+        ):
+            fetch_limit = min(
+                MAX_PAGE_SIZE,
+                MAX_SESSION_API_SCAN_ROWS - scanned,
+                safe_limit + 1 - len(selected) if safe_title is None else MAX_PAGE_SIZE,
+            )
+            result = client.list_sessions(
+                limit=fetch_limit,
+                offset=api_offset,
+                include_archived=safe_include_archived,
+                profile=safe_profile,
+            )
+            rows = result.get("sessions") if isinstance(result, dict) else None
+            if (
+                not isinstance(rows, list)
+                or len(rows) > fetch_limit
+                or any(
+                    not isinstance(row, dict)
+                    or not isinstance(row.get("id"), str)
+                    or (row.get("profile") is not None and row.get("profile") != safe_profile)
+                    for row in rows
+                )
+            ):
+                raise HermesAPIError("invalid_response")
+            if not rows:
+                source_exhausted = True
+                break
+            scanned += len(rows)
+            api_offset += len(rows)
+            for row in rows:
+                row_title = row.get("title")
+                if row_title is not None and not isinstance(row_title, str):
+                    raise HermesAPIError("invalid_response")
+                if safe_title is None or safe_title.casefold() in (row_title or "").casefold():
+                    if matched_count >= (safe_offset if safe_title is not None else 0):
+                        selected.append(_safe_session_metadata(row))
+                    matched_count += 1
+            if len(rows) < fetch_limit:
+                source_exhausted = True
+
+        if (
+            safe_title is not None
+            and not source_exhausted
+            and scanned >= MAX_SESSION_API_SCAN_ROWS
+            and len(selected) <= safe_limit
+        ):
+            raise RuntimeError("Session listing scan limit was reached before the requested page was determined.")
+        has_more = len(selected) > safe_limit or (
+            not source_exhausted and scanned >= MAX_SESSION_API_SCAN_ROWS
         )
-        sessions = [
-            _safe_session_metadata(row)
-            for row in rows
-            if isinstance(row, dict)
-        ]
+        sessions = selected[:safe_limit]
         return _session_page_response(
             "sessions",
             sessions,
             offset=safe_offset,
             requested_limit=safe_limit,
             extra={"profile": safe_profile},
+            has_more_override=has_more,
+            next_offset_override=safe_offset + len(sessions) if has_more else None,
         )
+    except HermesAPIError as exc:
+        return _session_error("SESSION_LIST_FAILED", _redact_error(exc))
     except _SESSION_ERRORS as exc:
         return _session_error("SESSION_LIST_FAILED", _redact_error(exc))
-    finally:
-        adapter.dispose_safely()
 
 
 def hermes_session_read(
@@ -1113,9 +1169,7 @@ def hermes_session_read(
     profile: str = "default",
 ) -> str:
     safe_profile = _validate_session_profile(profile)
-    adapter = ReadOnlySessionAdapter(profile=safe_profile)
     try:
-        require_imports()
         if not env_enabled(ENABLE_SESSION_SEARCH_ENV):
             return _session_error(
                 "SESSION_HISTORY_DISABLED",
@@ -1127,38 +1181,101 @@ def hermes_session_read(
         safe_include_inactive = _validate_bool(include_inactive, "include_inactive")
         safe_include_system = _validate_bool(include_system_messages, "include_system_messages")
         safe_include_tool = _validate_bool(include_tool_messages, "include_tool_messages")
-        _allowed_message_roles(
+        allowed_roles = _allowed_message_roles(
             include_system_messages=safe_include_system,
             include_tool_messages=safe_include_tool,
         )
-        adapter.open()
-        resolved_id = adapter.resolve_session_id(safe_id)
-        if not resolved_id:
-            return _session_error(
-                "SESSION_ID_NOT_FOUND_OR_AMBIGUOUS",
-                "The requested session ID was not found or is ambiguous.",
+
+        client = HermesAPIClient()
+        try:
+            session = client.get_session(safe_id, profile=safe_profile)
+        except HermesAPIError as exc:
+            if exc.status_code == 404:
+                return _session_error(
+                    "SESSION_ID_NOT_FOUND_OR_AMBIGUOUS",
+                    "The requested session ID was not found or is ambiguous.",
+                )
+            raise
+        resolved_id = session.get("id") if isinstance(session, dict) else None
+        if (
+            not isinstance(resolved_id, str)
+            or not resolved_id.startswith(safe_id)
+            or (session.get("profile") is not None and session.get("profile") != safe_profile)
+        ):
+            raise HermesAPIError("invalid_response")
+
+        messages: list[dict[str, Any]] = []
+        rows_scanned = 0
+        api_offset = 0
+        visible_examined = 0
+        source_exhausted = safe_limit == 0
+        while (
+            not source_exhausted
+            and len(messages) <= safe_limit
+            and rows_scanned < MAX_SESSION_API_SCAN_ROWS
+        ):
+            fetch_limit = min(
+                MAX_PAGE_SIZE,
+                MAX_SESSION_API_SCAN_ROWS - rows_scanned,
+                max(1, safe_limit + 1 - len(messages)),
             )
-        page = adapter.get_messages_page(
-            resolved_id,
-            limit=safe_limit,
-            offset=safe_offset,
-            include_inactive=safe_include_inactive,
-            include_system_messages=safe_include_system,
-            include_tool_messages=safe_include_tool,
+            page_offset = api_offset
+            result = client.get_session_messages(
+                resolved_id,
+                limit=fetch_limit,
+                offset=page_offset,
+                include_inactive=safe_include_inactive,
+                profile=safe_profile,
+            )
+            rows = result.get("messages") if isinstance(result, dict) else None
+            if (
+                not isinstance(result, dict)
+                or not isinstance(rows, list)
+                or len(rows) > fetch_limit
+                or (result.get("profile") is not None and result.get("profile") != safe_profile)
+                or any(not isinstance(row, dict) for row in rows)
+            ):
+                raise HermesAPIError("invalid_response")
+            if not rows:
+                source_exhausted = True
+                break
+            rows_scanned += len(rows)
+            for row in rows:
+                api_offset += 1
+                message = _safe_message(row, allowed_roles)
+                if message is None:
+                    continue
+                if visible_examined >= safe_offset:
+                    messages.append(message)
+                    if len(messages) > safe_limit:
+                        break
+                visible_examined += 1
+            if len(rows) < fetch_limit and len(messages) <= safe_limit:
+                source_exhausted = True
+
+        if (
+            not source_exhausted
+            and rows_scanned >= MAX_SESSION_API_SCAN_ROWS
+            and len(messages) < safe_limit
+        ):
+            raise RuntimeError("Session read scan limit was reached before the requested page was determined.")
+        has_more = len(messages) > safe_limit or (
+            not source_exhausted and rows_scanned >= MAX_SESSION_API_SCAN_ROWS
         )
+        messages = messages[:safe_limit]
         return _session_page_response(
             "messages",
-            page["messages"],
+            messages,
             offset=safe_offset,
             requested_limit=safe_limit,
             extra={"session_id": resolved_id, "profile": safe_profile},
-            has_more_override=page["has_more"],
-            next_offset_override=page["next_offset"],
+            has_more_override=has_more,
+            next_offset_override=safe_offset + len(messages),
         )
+    except HermesAPIError as exc:
+        return _session_error("SESSION_READ_FAILED", _redact_error(exc))
     except _SESSION_ERRORS as exc:
         return _session_error("SESSION_READ_FAILED", _redact_error(exc))
-    finally:
-        adapter.dispose_safely()
 
 
 def _session_markdown_response(

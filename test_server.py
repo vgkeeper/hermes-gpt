@@ -1085,28 +1085,20 @@ def test_bot_chat_send_targets_current_tip_in_requested_profile(monkeypatch):
 
 
 def test_phase2_session_list_projects_metadata_and_paginates(monkeypatch):
-    monkeypatch.setenv(server.ENABLE_SESSION_SEARCH_ENV, "1")
-    connection = sqlite3.connect(":memory:")
-    fake_db = _Phase1FakeSessionDB(
-        connection,
-        session_rows=[
-            {
-                "id": "session-1",
-                "source": "cli",
-                "started_at": 1.0,
-                "ended_at": 2.0,
-                "last_active": 2.0,
-                "message_count": 3,
-                "tool_call_count": 1,
-                "title": "private",
-                "preview": "private content",
-                "system_prompt": "hidden",
-                "cwd": r"C:\\Users\\example\\private",
-            },
-        ],
-    )
-    monkeypatch.setattr(server, "SessionDB", lambda **kwargs: fake_db)
-    monkeypatch.setattr(server, "require_imports", lambda: None)
+    client = _SessionHistoryAPIClient(sessions=[{
+        "id": "session-1",
+        "source": "cli",
+        "started_at": 1.0,
+        "ended_at": 2.0,
+        "last_active": 2.0,
+        "message_count": 3,
+        "tool_call_count": 1,
+        "title": "private",
+        "preview": "private content",
+        "system_prompt": "hidden",
+        "cwd": r"C:\\Users\\example\\private",
+    }])
+    _use_session_history_api(monkeypatch, client)
 
     result = json.loads(server.hermes_session_list(limit=20, offset=0))
     assert result["success"] is True
@@ -1119,10 +1111,7 @@ def test_phase2_session_list_projects_metadata_and_paginates(monkeypatch):
     assert "preview" not in result["sessions"][0]
     assert "system_prompt" not in result["sessions"][0]
     assert "cwd" not in result["sessions"][0]
-    assert fake_db.calls[0][1]["include_archived"] is False
-    assert fake_db.close_calls == 0
-    with pytest.raises(sqlite3.ProgrammingError):
-        connection.execute("select 1")
+    assert client.calls[0] == ("list", 21, 0, False, "default")
 
 
 def test_phase2_bot_chat_get_resolves_hidden_registry_to_current_tip(monkeypatch):
@@ -1220,18 +1209,15 @@ def test_phase2_bot_chat_get_rejects_internal_source(monkeypatch):
 
 
 def test_phase2_session_read_filters_and_resolves_ids(monkeypatch):
-    monkeypatch.setenv(server.ENABLE_SESSION_SEARCH_ENV, "1")
-    connection = sqlite3.connect(":memory:")
-    fake_db = _Phase1FakeSessionDB(
-        connection,
-        message_rows=[
+    client = _SessionHistoryAPIClient(
+        messages=[
             {"id": 1, "session_id": "session-1", "role": "user", "timestamp": 1, "content": "hello"},
             {"id": 2, "session_id": "session-1", "role": "assistant", "timestamp": 2, "content": "world"},
             {"id": 3, "session_id": "session-1", "role": "tool", "timestamp": 3, "content": "hidden"},
         ],
+        exact={"session-1": {"id": "session-1"}, "session-": {"id": "session-1"}},
     )
-    monkeypatch.setattr(server, "SessionDB", lambda **kwargs: fake_db)
-    monkeypatch.setattr(server, "require_imports", lambda: None)
+    _use_session_history_api(monkeypatch, client)
 
     result = json.loads(server.hermes_session_read("session-1", limit=2, offset=0))
     assert result["success"] is True
@@ -1239,12 +1225,10 @@ def test_phase2_session_read_filters_and_resolves_ids(monkeypatch):
     assert {row["role"] for row in result["messages"]} == {"user", "assistant"}
     assert result["returned_count"] == 2
     assert result["next_offset"] == 2
-    assert result["has_more"] is True
+    assert result["has_more"] is False
     assert result["truncated"] is False
-    with pytest.raises(sqlite3.ProgrammingError):
-        connection.execute("select 1")
 
-    prefix_result = json.loads(server.hermes_session_read("prefix", limit=1))
+    prefix_result = json.loads(server.hermes_session_read("session-", limit=1))
     assert prefix_result["success"] is True
     assert prefix_result["session_id"] == "session-1"
 
@@ -1264,15 +1248,15 @@ def test_phase2_session_read_denies_internal_roles_without_gate(monkeypatch):
 
 
 def test_phase2_session_read_rejects_missing_and_ambiguous_ids(monkeypatch):
-    monkeypatch.setenv(server.ENABLE_SESSION_SEARCH_ENV, "1")
-    monkeypatch.setattr(server, "require_imports", lambda: None)
-    connection = _Phase1FakeConnection()
-    fake_db = _Phase1FakeSessionDB(connection)
-    monkeypatch.setattr(server, "SessionDB", lambda **kwargs: fake_db)
     for value in ("missing", "ambiguous"):
+        client = _SessionHistoryAPIClient(
+            exact={value: server.HermesAPIError("http_error", 404)}
+        )
+        _use_session_history_api(monkeypatch, client)
         result = json.loads(server.hermes_session_read(value))
         assert result["success"] is False
         assert result["error"]["code"] == "SESSION_ID_NOT_FOUND_OR_AMBIGUOUS"
+        assert [call[0] for call in client.calls] == ["get"]
 
 
 def test_phase2_response_size_is_enforced():
@@ -1730,3 +1714,201 @@ def test_autopilot_tools_register_only_behind_their_machine_gate(monkeypatch):
     assert schema["max_concurrency"]["default"] == 3 and schema["max_replans"]["default"] == 2
     assert schema["max_attempts_per_node"]["default"] == 3 and schema["max_runtime_seconds"]["default"] == 86400
     assert schema["dry_run"]["default"] is True and schema["confirm"]["default"] is False
+
+
+class _SessionHistoryAPIClient:
+    def __init__(self, sessions=None, messages=None, *, exact=None):
+        self.sessions = list(sessions or [])
+        self.messages = list(messages or [])
+        self.exact = dict(exact or {})
+        self.calls = []
+
+    def list_sessions(self, *, limit, offset, include_archived, profile):
+        self.calls.append(("list", limit, offset, include_archived, profile))
+        return {"sessions": self.sessions[offset:offset + limit]}
+
+    def get_session(self, session_id, *, profile):
+        self.calls.append(("get", session_id, profile))
+        result = self.exact.get(session_id)
+        if isinstance(result, Exception):
+            raise result
+        if result is not None:
+            return result
+        match = next((row for row in self.sessions if row["id"] == session_id), None)
+        if match is None:
+            raise server.HermesAPIError("http_error", 404)
+        return match
+
+    def get_session_messages(self, session_id, *, limit, offset, include_inactive, profile):
+        self.calls.append(("messages", session_id, limit, offset, include_inactive, profile))
+        return {"messages": self.messages[offset:offset + limit]}
+
+
+def _use_session_history_api(monkeypatch, client):
+    monkeypatch.setenv(server.ENABLE_SESSION_SEARCH_ENV, "1")
+    monkeypatch.setattr(server, "_validate_session_profile", lambda profile="default": profile)
+    monkeypatch.setattr(server, "HermesAPIClient", lambda: client)
+    monkeypatch.setattr(
+        server, "ReadOnlySessionAdapter",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("SessionDB path invoked")),
+    )
+    monkeypatch.setattr(
+        server, "SessionDB",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("SessionDB path invoked")),
+    )
+
+
+def test_session_list_api_scans_title_filter_and_preserves_archive_profile(monkeypatch):
+    monkeypatch.setattr(server, "MAX_PAGE_SIZE", 2)
+    client = _SessionHistoryAPIClient(sessions=[
+        {"id": "a", "title": "Other", "archived": False},
+        {"id": "b", "title": "Needle one", "archived": False},
+        {"id": "c", "title": "needle two", "archived": True},
+        {"id": "d", "title": "Needle three", "archived": False},
+    ])
+    _use_session_history_api(monkeypatch, client)
+
+    result = json.loads(server.hermes_session_list(
+        limit=1, offset=1, include_archived=True, profile="research", title=" needle "
+    ))
+
+    assert result["success"] is True
+    assert result["profile"] == "research"
+    assert result["sessions"][0]["id"] == "c"
+    assert result["sessions"][0]["has_title"] is True
+    assert "title" not in result["sessions"][0]
+    assert client.calls == [
+        ("list", 2, 0, True, "research"),
+        ("list", 2, 2, True, "research"),
+    ]
+
+
+def test_session_list_stops_at_strict_scan_bound(monkeypatch):
+    monkeypatch.setattr(server, "MAX_PAGE_SIZE", 2)
+    monkeypatch.setattr(server, "MAX_SESSION_API_SCAN_ROWS", 5)
+    sessions = [{"id": str(index), "title": "not a match"} for index in range(20)]
+    client = _SessionHistoryAPIClient(sessions=sessions)
+    _use_session_history_api(monkeypatch, client)
+
+    result = json.loads(server.hermes_session_list(title="missing"))
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "SESSION_LIST_FAILED"
+    assert [call[1:3] for call in client.calls] == [(2, 0), (2, 2), (1, 4)]
+    assert sum(call[1] for call in client.calls) == 5
+
+
+def test_session_list_api_malformed_response_fails_safely(monkeypatch):
+    class MalformedClient(_SessionHistoryAPIClient):
+        def list_sessions(self, **kwargs):
+            return {"sessions": [{"title": "no id"}]}
+    client = MalformedClient()
+    _use_session_history_api(monkeypatch, client)
+
+    result = json.loads(server.hermes_session_list())
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "SESSION_LIST_FAILED"
+
+
+def test_session_read_exact_id_wins_and_profile_is_carried_through(monkeypatch):
+    client = _SessionHistoryAPIClient(
+        sessions=[{"id": "abc", "title": "exact"}, {"id": "abc-long", "title": "prefix"}],
+        messages=[{"id": 1, "session_id": "abc", "role": "user", "content": "safe"}],
+    )
+    _use_session_history_api(monkeypatch, client)
+
+    result = json.loads(server.hermes_session_read("abc", profile="research", limit=1))
+
+    assert result["success"] is True
+    assert result["session_id"] == "abc"
+    assert result["profile"] == "research"
+    assert [call[0] for call in client.calls] == ["get", "messages"]
+    assert client.calls[0] == ("get", "abc", "research")
+    assert client.calls[1][-1] == "research"
+
+
+def test_session_read_prefix_requires_api_unique_resolution(monkeypatch):
+    client = _SessionHistoryAPIClient(
+        messages=[{"id": 1, "session_id": "abc-one", "role": "assistant", "content": "ok"}],
+        exact={"abc": {"id": "abc-one"}},
+    )
+    _use_session_history_api(monkeypatch, client)
+
+    result = json.loads(server.hermes_session_read("abc", profile="builder", limit=1))
+
+    assert result["success"] is True
+    assert result["session_id"] == "abc-one"
+    assert client.calls[0] == ("get", "abc", "builder")
+    assert client.calls[1][1] == "abc-one"
+    assert client.calls[1][-1] == "builder"
+
+
+def test_session_read_ambiguous_or_missing_prefix_fails_without_reading_messages(monkeypatch):
+    for status in (404, 503):
+        client = _SessionHistoryAPIClient(
+            exact={"abc": server.HermesAPIError("http_error", status)}
+        )
+        _use_session_history_api(monkeypatch, client)
+
+        result = json.loads(server.hermes_session_read("abc"))
+
+        assert result["success"] is False
+        assert result["error"]["code"] == (
+            "SESSION_ID_NOT_FOUND_OR_AMBIGUOUS" if status == 404 else "SESSION_READ_FAILED"
+        )
+        assert [call[0] for call in client.calls] == ["get"]
+
+
+def test_session_read_filters_roles_before_filling_page_and_obeys_scan_bound(monkeypatch):
+    monkeypatch.setattr(server, "MAX_PAGE_SIZE", 2)
+    client = _SessionHistoryAPIClient(
+        exact={"session": {"id": "session"}},
+        messages=[
+            {"id": 1, "session_id": "session", "role": "system", "content": "hidden-1"},
+            {"id": 2, "session_id": "session", "role": "tool", "content": "hidden-2"},
+            {"id": 3, "session_id": "session", "role": "user", "content": "visible-1"},
+            {"id": 4, "session_id": "session", "role": "function", "content": "hidden-3"},
+            {"id": 5, "session_id": "session", "role": "assistant", "content": "visible-2"},
+        ],
+    )
+    _use_session_history_api(monkeypatch, client)
+
+    result = json.loads(server.hermes_session_read("session", limit=2))
+
+    assert [message["content"] for message in result["messages"]] == ["visible-1", "visible-2"]
+    assert result["next_offset"] == 2
+    assert result["has_more"] is False
+    assert [call[3] for call in client.calls if call[0] == "messages"] == [0, 2, 4]
+
+
+
+
+def test_session_read_caps_total_scanned_messages(monkeypatch):
+    monkeypatch.setattr(server, "MAX_PAGE_SIZE", 2)
+    monkeypatch.setattr(server, "MAX_SESSION_API_SCAN_ROWS", 5)
+    client = _SessionHistoryAPIClient(
+        exact={"session": {"id": "session"}},
+        messages=[{"id": i, "session_id": "session", "role": "system", "content": "hidden"} for i in range(20)],
+    )
+    _use_session_history_api(monkeypatch, client)
+
+    result = json.loads(server.hermes_session_read("session", limit=1))
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "SESSION_READ_FAILED"
+    pages = [call for call in client.calls if call[0] == "messages"]
+    assert [call[2:4] for call in pages] == [(2, 0), (2, 2), (1, 4)]
+    assert sum(call[2] for call in pages) == 5
+
+def test_session_read_api_errors_and_bad_pages_fail_safely(monkeypatch):
+    class BadPageClient(_SessionHistoryAPIClient):
+        def get_session_messages(self, *args, **kwargs):
+            return {"messages": ["not a message"]}
+    client = BadPageClient(exact={"session": {"id": "session"}})
+    _use_session_history_api(monkeypatch, client)
+
+    result = json.loads(server.hermes_session_read("session"))
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "SESSION_READ_FAILED"

@@ -286,6 +286,91 @@ def test_get_session_and_profile_routes(monkeypatch):
     assert seen == ["http://hermes-agent:8642/p/chat/api/sessions/s1"]
 
 
+def test_list_sessions_encodes_pagination_archive_filter_and_profile(monkeypatch):
+    _configure(monkeypatch)
+    seen = []
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda request, timeout: seen.append(request.full_url) or _Response(b'{"sessions":[]}'),
+    )
+
+    result = api.HermesAPIClient().list_sessions(
+        limit=7, offset=12, include_archived=True, profile="project_manager"
+    )
+
+    assert result == {"sessions": []}
+    assert seen == [
+        "http://hermes-agent:8642/p/project_manager/api/sessions?limit=7&offset=12&archived=include"
+    ]
+
+
+def test_get_session_messages_encodes_query_and_validates_response(monkeypatch):
+    _configure(monkeypatch)
+    seen = []
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda request, timeout: seen.append(request.full_url)
+        or _Response(b'{"session_id":"s1","messages":[]}'),
+    )
+
+    result = api.HermesAPIClient().get_session_messages(
+        "s1", limit=25, offset=9, include_inactive=True, profile="research"
+    )
+
+    assert result == {"session_id": "s1", "messages": []}
+    assert seen == [
+        (
+            "http://hermes-agent:8642/p/research/api/sessions/s1/messages"
+            "?limit=25&offset=9&order=oldest&include_compacted=true"
+        )
+    ]
+
+
+def test_session_api_methods_reject_invalid_query_inputs_without_requests(monkeypatch):
+    _configure(monkeypatch)
+    client = api.HermesAPIClient()
+    calls = []
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: calls.append(args))
+
+    invalid_calls = (
+        lambda: client.list_sessions(limit=True),
+        lambda: client.list_sessions(limit=101),
+        lambda: client.list_sessions(offset=-1),
+        lambda: client.list_sessions(include_archived=1),
+        lambda: client.list_sessions(profile="bad/profile"),
+        lambda: client.get_session_messages("s1", limit=501),
+        lambda: client.get_session_messages("s1", offset=10_001),
+        lambda: client.get_session_messages("s1", include_inactive="true"),
+        lambda: client.get_session_messages("../other"),
+        lambda: client.get_session_messages("s1", profile=""),
+    )
+    for call in invalid_calls:
+        with pytest.raises(api.HermesAPIError) as error:
+            call()
+        assert error.value.category == "invalid_input"
+    assert calls == []
+
+
+@pytest.mark.parametrize("body", [b'{"sessions":null}', b'{"sessions":[null]}'])
+def test_list_sessions_rejects_malformed_rows(monkeypatch, body):
+    _configure(monkeypatch)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_args, **_kwargs: _Response(body))
+    with pytest.raises(api.HermesAPIError) as error:
+        api.HermesAPIClient().list_sessions()
+    assert error.value.category == "invalid_response"
+
+
+def test_get_session_messages_rejects_malformed_rows(monkeypatch):
+    _configure(monkeypatch)
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda *_args, **_kwargs: _Response(b'{"messages":[null]}')
+    )
+    with pytest.raises(api.HermesAPIError) as error:
+        api.HermesAPIClient().get_session_messages("s1")
+    assert error.value.category == "invalid_response"
+
 def test_profile_session_run_and_idempotency_validation(monkeypatch):
     _configure(monkeypatch)
     client = api.HermesAPIClient()
