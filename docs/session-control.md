@@ -27,6 +27,10 @@ shared-state timeout behavior. Every runtime that reads or reconciles these
 records must use lease-aware code (or the legacy shared-state flag); an older
 runtime with shared-state disabled can still write a false orphan marker.
 
+## Official API-backed session controls (initial migration)
+
+`hermes_session_create`, `hermes_session_continue`, `hermes_session_send`, and the `hermes_session_job_*` status/result/wait tools use the official Hermes HTTP API. Creation issues `POST /api/sessions` followed by `POST /v1/runs`; continuation submits `POST /v1/runs` with the session ID. API run IDs (`run_*`) are read from `GET /v1/runs/{run_id}`. Existing legacy job IDs remain readable through the prior local job store. New execution never falls back to a local CLI/worker if an API call fails. This migration does not cover session list/read/search/export, bot chat, or the legacy worker.
+
 ## Workflow
 
 1. Find a session ID with `hermes_session_list` when history is enabled.

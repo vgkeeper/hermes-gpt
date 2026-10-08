@@ -986,91 +986,43 @@ def test_phase2_tools_are_gated_and_registered(monkeypatch):
     assert "hermes_session_lineage_export" not in names
 
 
-def test_session_continue_resolves_id_before_runner_dispatch(monkeypatch, tmp_path):
+def test_session_continue_uses_official_api_and_routes_profile(monkeypatch):
     monkeypatch.setenv(server.ENABLE_SESSION_CONTROL_ENV, "1")
-    monkeypatch.setattr(server, "require_imports", lambda: None)
-    connection = sqlite3.connect(":memory:")
-    fake_db = _Phase1FakeSessionDB(connection)
-    monkeypatch.setattr(server, "SessionDB", lambda **kwargs: fake_db)
-    monkeypatch.setattr(server, "_default_hermes_root", lambda: tmp_path)
-    dispatched = {}
-
-    def fake_continue(session_id, prompt, max_job_runtime_seconds, **kwargs):
-        dispatched.update(
-            session_id=session_id, prompt=prompt, max_job_runtime_seconds=max_job_runtime_seconds, **kwargs
-        )
-        return {"success": True, "job_id": "a" * 32, "status": "running"}
-
-    monkeypatch.setattr(server.op_session, "hermes_session_continue", fake_continue)
-    result = server.hermes_session_continue("prefix", "continue safely", max_job_runtime_seconds=123)
-
-    assert result["success"] is True
-    assert dispatched["session_id"] == "session-1"
-    assert dispatched["prompt"] == "continue safely"
-    assert dispatched["max_job_runtime_seconds"] == 123
-    assert dispatched["hermes_root"] == tmp_path
-    assert dispatched["profile"] == "default"
-    with pytest.raises(sqlite3.ProgrammingError):
-        connection.execute("select 1")
-
-
-def test_session_continue_resolves_id_in_requested_profile(monkeypatch, tmp_path):
-    monkeypatch.setenv(server.ENABLE_SESSION_CONTROL_ENV, "1")
-    monkeypatch.setattr(server, "require_imports", lambda: None)
+    monkeypatch.setattr(server, "_start_session_api_supervisor", lambda *args: True)
     monkeypatch.setattr(server, "_validate_session_profile", lambda profile="default": profile)
-    connection = sqlite3.connect(":memory:")
-    fake_db = _Phase1FakeSessionDB(connection)
-    monkeypatch.setattr(server, "SessionDB", lambda **kwargs: fake_db)
-    monkeypatch.setattr(server, "_default_hermes_root", lambda: tmp_path)
-    dispatched = {}
+    seen = {}
 
-    def fake_continue(session_id, prompt, max_job_runtime_seconds, **kwargs):
-        dispatched.update(
-            session_id=session_id, prompt=prompt, max_job_runtime_seconds=max_job_runtime_seconds, **kwargs
-        )
-        return {"success": True, "job_id": "b" * 32, "status": "running"}
+    class Client:
+        def create_run(self, prompt, *, session_id, profile):
+            seen.update(prompt=prompt, session_id=session_id, profile=profile)
+            return {"run_id": "run_123", "status": "started"}
 
-    monkeypatch.setattr(server.op_session, "hermes_session_continue", fake_continue)
-    result = server.hermes_session_continue(
-        "prefix",
-        "send to project manager",
-        max_job_runtime_seconds=60,
-        profile="project-manager",
-    )
-
-    assert result["success"] is True
-    assert dispatched["session_id"] == "session-1"
-    assert dispatched["profile"] == "project-manager"
-    with pytest.raises(sqlite3.ProgrammingError):
-        connection.execute("select 1")
+    monkeypatch.setattr(server, "HermesAPIClient", Client)
+    result = server.hermes_session_continue("sess_1", "continue safely", profile="project-manager")
+    assert result == {"success": True, "job_id": "run_123", "session_id": "sess_1",
+                      "profile": "project-manager", "status": "started", "return_code": None}
+    assert seen == {"prompt": "continue safely", "session_id": "sess_1", "profile": "project-manager"}
 
 
-def test_session_create_dispatches_to_runner_with_new_session(monkeypatch, tmp_path):
+def test_session_create_uses_api_session_then_run(monkeypatch):
     monkeypatch.setenv(server.ENABLE_SESSION_CONTROL_ENV, "1")
-    monkeypatch.setattr(server, "require_imports", lambda: None)
-    monkeypatch.setattr(server, "_default_hermes_root", lambda: tmp_path)
-    dispatched = {}
+    monkeypatch.setattr(server, "_start_session_api_supervisor", lambda *args: True)
+    monkeypatch.setattr(server, "_validate_session_profile", lambda profile="default": profile)
+    calls = []
 
-    def fake_create(prompt, max_job_runtime_seconds, **kwargs):
-        dispatched.update(prompt=prompt, max_job_runtime_seconds=max_job_runtime_seconds, **kwargs)
-        return {
-            "success": True,
-            "job_id": "d" * 32,
-            "session_id": "20260923_120000_abcdef",
-            "profile": "default",
-            "status": "running",
-        }
+    class Client:
+        def create_session(self, **kwargs):
+            calls.append(("create", kwargs))
+            return {"session_id": "sess_new"}
+        def create_run(self, prompt, *, session_id, profile):
+            calls.append(("run", prompt, session_id, profile))
+            return {"run_id": "run_new", "status": "running"}
 
-    monkeypatch.setattr(server.op_session, "hermes_session_create", fake_create)
-    result = server.hermes_session_create(
-        "first work", max_job_runtime_seconds=300, title="A fresh session"
-    )
-    assert result["success"] is True
-    assert dispatched["prompt"] == "first work"
-    assert dispatched["max_job_runtime_seconds"] == 300
-    assert dispatched["hermes_root"] == tmp_path
-    assert dispatched["profile"] == "default"
-    assert dispatched["title"] == "A fresh session"
+    monkeypatch.setattr(server, "HermesAPIClient", Client)
+    result = server.hermes_session_create("first work", profile="default", title="Fresh")
+    assert result["job_id"] == "run_new"
+    assert calls == [("create", {"title": "Fresh", "source": "hermes-gpt", "profile": "default"}),
+                     ("run", "first work", "sess_new", "default")]
 
 
 def test_session_create_disabled_without_env_gate(monkeypatch):

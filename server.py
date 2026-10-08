@@ -10,6 +10,8 @@ import os
 import re
 import sqlite3
 import sys
+import threading
+import time
 import urllib.parse
 from pathlib import Path
 from types import TracebackType
@@ -56,6 +58,7 @@ import operator_skills as op_skills
 import operator_swarm as op_swarm
 import operator_work_bridge as op_work_bridge
 import operator_workspace as op_workspace
+from hermes_api_client import HermesAPIClient, HermesAPIError
 from versioning import VERSION
 
 LOCAL_DEV_PROFILE = "local-dev"
@@ -1317,179 +1320,431 @@ def hermes_session_search(
         adapter.dispose_safely()
 
 
+def _session_api_error(message: str, code: str = "HERMES_API_ERROR") -> dict[str, Any]:
+    return op_policy.make_error_envelope(
+        layer="session_control", code=code, safe_message=message[:500],
+        suggested_action="Check Hermes API configuration and try again.",
+    )
+
+
+def _session_api_run_id(job_id: str) -> bool:
+    return isinstance(job_id, str) and job_id.startswith("run_")
+
+
+def _session_api_view(job_id: str, run: dict[str, Any], profile: str = "default") -> dict[str, Any]:
+    status = str(run.get("status", "running")).lower()
+    if status in {"succeeded", "success", "done"}:
+        status = "completed"
+    elif status in {"error", "errored"}:
+        status = "failed"
+    elif status not in {"completed", "failed", "cancelled", "interrupted", "queued", "pending", "started", "running"}:
+        status = "running"
+    return {
+        "success": True, "job_id": job_id, "session_id": run.get("session_id"),
+        "profile": profile, "status": status,
+        "return_code": None, "response": run.get("output", ""),
+    }
+
+
+_SESSION_API_SUPERVISORS_LOCK = threading.Lock()
+_SESSION_API_SUPERVISORS: dict[str, dict[str, Any]] = {}
+_SESSION_API_SESSION_OWNERS: dict[tuple[str, str], object | str] = {}
+_SESSION_API_TERMINAL_STATES = {"completed", "failed", "cancelled", "interrupted"}
+_SESSION_API_TERMINAL_EVENTS = {f"run.{state}" for state in _SESSION_API_TERMINAL_STATES}
+_SESSION_API_STOP_GRACE_SECONDS = 10.0
+_SESSION_API_SSE_WINDOW_SECONDS = 12.0
+
+
+def _session_api_is_terminal(run: dict[str, Any]) -> bool:
+    return _session_api_view(str(run.get("run_id", "")), run).get("status") in _SESSION_API_TERMINAL_STATES
+
+
+def _reserve_session_api_session(profile: str, session_id: str) -> object | None:
+    key = (profile, session_id)
+    reservation = object()
+    with _SESSION_API_SUPERVISORS_LOCK:
+        if key in _SESSION_API_SESSION_OWNERS:
+            return None
+        _SESSION_API_SESSION_OWNERS[key] = reservation
+    return reservation
+
+
+def _release_session_api_reservation(profile: str, session_id: str, reservation: object) -> None:
+    key = (profile, session_id)
+    with _SESSION_API_SUPERVISORS_LOCK:
+        if _SESSION_API_SESSION_OWNERS.get(key) is reservation:
+            _SESSION_API_SESSION_OWNERS.pop(key, None)
+
+
+def _session_api_timeout(state: dict[str, Any]) -> None:
+    with state["state_lock"]:
+        if state["terminal_observed"] or state["finished"] or state["stop_started"]:
+            state["stop_finished"].set()
+            return
+        state["timed_out"] = True
+        state["stop_started"] = True
+    try:
+        state["client"].stop_run(state["run_id"], profile=state["profile"])
+    except HermesAPIError:
+        pass
+    except Exception:
+        # Timer-thread boundary: don't leak unexpected exception details.
+        pass
+    finally:
+        state["stop_finished"].set()
+
+
+def _publish_session_api_terminal(state: dict[str, Any], run: dict[str, Any]) -> None:
+    mission_id = state["mission_id"]
+    if not mission_id:
+        return
+    status = _session_api_view(state["run_id"], run, state["profile"])["status"]
+    if status not in _SESSION_API_TERMINAL_STATES:
+        return
+    with state["state_lock"]:
+        timed_out = state["timed_out"]
+    payload = {
+        "job_id": state["run_id"], "session_id": state["session_id"],
+        "status": status, "profile": state["profile"],
+    }
+    if timed_out:
+        payload["timed_out"] = True
+    try:
+        op_live_events.publish_event(
+            topic="session", kind="job.terminal", subject_type="job",
+            subject_id=state["run_id"], mission_id=mission_id,
+            source="hermes-api-bridge", payload=payload,
+            event_id=f"lev-session-job-{state['run_id']}",
+            hermes_root=_default_hermes_root(),
+        )
+    except Exception:
+        # Event publication is best-effort and cannot change durable run status.
+        return
+
+
+def _finish_session_api_supervisor(state: dict[str, Any], run: dict[str, Any]) -> None:
+    with state["state_lock"]:
+        if state["finished"]:
+            return
+        state["terminal_observed"] = True
+        state["finished"] = True
+    _publish_session_api_terminal(state, run)
+
+
+def _supervise_session_api_run(state: dict[str, Any]) -> None:
+    client = state["client"]
+    backoff = 0.25
+    try:
+        while True:
+            with state["state_lock"]:
+                timed_out = state["timed_out"]
+            if timed_out:
+                if not state["stop_finished"].wait(_SESSION_API_STOP_GRACE_SECONDS):
+                    return
+                grace_deadline = time.monotonic() + _SESSION_API_STOP_GRACE_SECONDS
+                while time.monotonic() < grace_deadline:
+                    try:
+                        durable = client.get_run(state["run_id"], profile=state["profile"])
+                    except HermesAPIError:
+                        delay = min(backoff, max(0.05, grace_deadline - time.monotonic()))
+                        time.sleep(delay)
+                        backoff = min(backoff * 2, 1.0)
+                        continue
+                    if _session_api_is_terminal(durable):
+                        _finish_session_api_supervisor(state, durable)
+                        return
+                    time.sleep(min(0.5, max(0.0, grace_deadline - time.monotonic())))
+                return
+
+            sse_failed = False
+            saw_terminal_event = False
+            stream_deadline = time.monotonic() + _SESSION_API_SSE_WINDOW_SECONDS
+            try:
+                for event in client.iter_run_events(
+                    state["run_id"], profile=state["profile"],
+                    stream_deadline_monotonic=stream_deadline,
+                ):
+                    if event.get("event") in _SESSION_API_TERMINAL_EVENTS:
+                        saw_terminal_event = True
+                        break
+                    with state["state_lock"]:
+                        if state["timed_out"]:
+                            break
+            except HermesAPIError as exc:
+                sse_failed = exc.category != "stream_deadline"
+            if not saw_terminal_event and time.monotonic() < stream_deadline:
+                sse_failed = True
+
+            # One durable read per completed/failed SSE window. Healthy SSE
+            # doesn't trigger periodic polling; it is reopened after its window.
+            try:
+                durable = client.get_run(state["run_id"], profile=state["profile"])
+            except HermesAPIError:
+                with state["state_lock"]:
+                    timed_out = state["timed_out"]
+                if timed_out:
+                    continue
+                if sse_failed:
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 5.0)
+                continue
+            if _session_api_is_terminal(durable):
+                _finish_session_api_supervisor(state, durable)
+                return
+            with state["state_lock"]:
+                timed_out = state["timed_out"]
+            if timed_out:
+                continue
+            if sse_failed:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 5.0)
+    except Exception:
+        # Final thread boundary: cleanup is guaranteed and exception details
+        # (which may contain transport data) are intentionally not logged.
+        return
+    finally:
+        timer = state.get("timer")
+        if timer is not None:
+            timer.cancel()
+        with _SESSION_API_SUPERVISORS_LOCK:
+            if _SESSION_API_SUPERVISORS.get(state["run_id"]) is state:
+                _SESSION_API_SUPERVISORS.pop(state["run_id"], None)
+            key = state["session_key"]
+            if _SESSION_API_SESSION_OWNERS.get(key) == state["run_id"]:
+                _SESSION_API_SESSION_OWNERS.pop(key, None)
+        with state["state_lock"]:
+            state["finished"] = True
+
+
+def _start_session_api_supervisor(
+    client: HermesAPIClient, run_id: str, session_id: str, profile: str,
+    max_job_runtime_seconds: int, mission_id: str, reservation: object | None = None,
+) -> bool:
+    session_key = (profile, session_id)
+    owns_reservation = reservation is None
+    if reservation is None:
+        reservation = _reserve_session_api_session(profile, session_id)
+    if reservation is None:
+        return False
+    state: dict[str, Any] = {
+        "client": client, "run_id": run_id, "session_id": session_id,
+        "profile": profile, "mission_id": mission_id, "timed_out": False,
+        "stop_finished": threading.Event(), "state_lock": threading.Lock(),
+        "terminal_observed": False, "finished": False, "stop_started": False,
+        "session_key": session_key,
+    }
+    timer = threading.Timer(max_job_runtime_seconds, _session_api_timeout, args=(state,))
+    timer.daemon = True
+    state["timer"] = timer
+    thread = threading.Thread(target=_supervise_session_api_run, args=(state,),
+                              name=f"hermes-api-run-{run_id}", daemon=True)
+    with _SESSION_API_SUPERVISORS_LOCK:
+        if run_id in _SESSION_API_SUPERVISORS or _SESSION_API_SESSION_OWNERS.get(session_key) is not reservation:
+            if owns_reservation and _SESSION_API_SESSION_OWNERS.get(session_key) is reservation:
+                _SESSION_API_SESSION_OWNERS.pop(session_key, None)
+            return False
+        _SESSION_API_SUPERVISORS[run_id] = state
+        _SESSION_API_SESSION_OWNERS[session_key] = run_id
+    try:
+        timer.start()
+        thread.start()
+    except Exception:
+        with state["state_lock"]:
+            state["finished"] = True
+        timer.cancel()
+        with _SESSION_API_SUPERVISORS_LOCK:
+            if _SESSION_API_SUPERVISORS.get(run_id) is state:
+                _SESSION_API_SUPERVISORS.pop(run_id, None)
+            if _SESSION_API_SESSION_OWNERS.get(session_key) == run_id:
+                _SESSION_API_SESSION_OWNERS.pop(session_key, None)
+        return False
+    return True
+
+
+def _session_api_started(
+    run: dict[str, Any], session_id: str, profile: str, client: HermesAPIClient,
+    max_job_runtime_seconds: int, mission_id: str, reservation: object,
+) -> dict[str, Any]:
+    run_id = run.get("run_id")
+    if not _session_api_run_id(run_id):
+        _release_session_api_reservation(profile, session_id, reservation)
+        return _session_api_error("Hermes API returned an invalid run ID.")
+    started = _start_session_api_supervisor(
+        client, run_id, session_id, profile, max_job_runtime_seconds, mission_id, reservation
+    )
+    if not started:
+        try:
+            client.stop_run(run_id, profile=profile)
+        except HermesAPIError:
+            pass
+        except Exception:
+            # Best-effort cleanup must not replace SUPERVISOR_START_FAILED.
+            pass
+        finally:
+            _release_session_api_reservation(profile, session_id, reservation)
+        return _session_api_error("The API run was accepted but its supervisor could not start.", "SUPERVISOR_START_FAILED")
+    return {"success": True, "job_id": run_id, "session_id": session_id,
+            "profile": profile, "status": run.get("status", "running"), "return_code": None}
+
+
 def hermes_session_continue(
     session_id: str,
     prompt: str,
-    max_job_runtime_seconds: Annotated[
-        int,
-        Field(
-            description=(
-                "Durée maximale du travail Hermes en secondes : à expiration, Hermes"
-                " et ses enfants sont arrêtés. Sans rapport avec hermes_session_job_wait"
-                " (max 120 s, ne tue jamais le job)."
-            ),
-            ge=op_session.MIN_JOB_RUNTIME_SECONDS,
-            le=DEFAULT_SESSION_MAX_RUNTIME_SECONDS,
-        ),
-    ] = DEFAULT_SESSION_MAX_RUNTIME_SECONDS,
-    profile: str = "default",
-    mission_id: Annotated[
-        str,
-        Field(
-            description=(
-                "Optional Mission ID to associate with this job. A terminal job publishes "
-                "a session/job.terminal wake-up event when set; omit it for historical behavior."
-            )
-        ),
-    ] = "",
-) -> dict[str, Any]:
-    """Start one bounded, asynchronous turn in an existing Hermes session for a profile."""
-    safe_profile = _validate_session_profile(profile)
-    adapter = ReadOnlySessionAdapter(profile=safe_profile)
-    try:
-        require_imports()
-        if not env_enabled(ENABLE_SESSION_CONTROL_ENV):
-            return op_session.hermes_session_continue(
-                session_id,
-                prompt,
-                max_job_runtime_seconds=max_job_runtime_seconds,
-                hermes_root=_default_hermes_root(),
-                agent_root=HERMES_ROOT,
-                profile=safe_profile,
-                mission_id=mission_id,
-            )
-        adapter.open()
-        resolved_id = adapter.resolve_session_id(session_id)
-        if not resolved_id:
-            return op_policy.make_error_envelope(
-                layer="session_control",
-                code="SESSION_ID_NOT_FOUND_OR_AMBIGUOUS",
-                safe_message="The requested session ID was not found or is ambiguous in the requested profile.",
-                suggested_action="Use an exact or unique-prefix ID returned by hermes_session_list for that profile.",
-            )
-        return op_session.hermes_session_continue(
-            resolved_id,
-            prompt,
-            max_job_runtime_seconds=max_job_runtime_seconds,
-            hermes_root=_default_hermes_root(),
-            agent_root=HERMES_ROOT,
-            profile=safe_profile,
-            mission_id=mission_id,
-        )
-    except _SESSION_ERRORS as exc:
-        return op_policy.make_error_envelope(
-            layer="session_control",
-            code="SESSION_CONTINUE_FAILED",
-            safe_message=_redact_error(exc),
-            suggested_action="Check the Hermes session database, profile, and local CLI installation.",
-        )
-    finally:
-        adapter.dispose_safely()
-
-
-def hermes_session_send(
-    session_id: str,
-    prompt: str,
     max_job_runtime_seconds: Annotated[int, Field(
-        description="Durée maximale du travail Hermes en secondes : à expiration, Hermes et ses enfants sont arrêtés. Sans rapport avec hermes_session_job_wait.",
-        ge=op_session.MIN_JOB_RUNTIME_SECONDS,
+        description="Maximum run duration in seconds; separate from hermes_session_job_wait (bounded to 120 seconds).", ge=op_session.MIN_JOB_RUNTIME_SECONDS,
         le=DEFAULT_SESSION_MAX_RUNTIME_SECONDS,
     )] = DEFAULT_SESSION_MAX_RUNTIME_SECONDS,
     profile: str = "default",
-    mission_id: Annotated[
-        str,
-        Field(description="Optional Mission ID for the terminal session/job wake-up event."),
-    ] = "",
+    mission_id: str = "",
 ) -> dict[str, Any]:
-    """Alias for profile-aware hermes_session_continue for clients that use send terminology."""
-    return hermes_session_continue(
-        session_id,
-        prompt,
-        max_job_runtime_seconds=max_job_runtime_seconds,
-        profile=profile,
-        mission_id=mission_id,
+    """Submit a turn to an existing session through the official Hermes API."""
+    safe_profile = _validate_session_profile(profile)
+    checked = op_session._validate_start(
+        session_id, prompt, max_job_runtime_seconds, safe_profile, mission_id
     )
+    if isinstance(checked, dict):
+        return checked
+    safe_session_id, safe_prompt, safe_timeout, safe_profile, safe_mission_id = checked
+    reservation = _reserve_session_api_session(safe_profile, safe_session_id)
+    if reservation is None:
+        return _session_api_error("A run is already active for this session.", "SESSION_BUSY")
+    try:
+        client = HermesAPIClient()
+        run = client.create_run(safe_prompt, session_id=safe_session_id, profile=safe_profile)
+        return _session_api_started(
+            run, safe_session_id, safe_profile, client, safe_timeout, safe_mission_id, reservation
+        )
+    except HermesAPIError as exc:
+        _release_session_api_reservation(safe_profile, safe_session_id, reservation)
+        return _session_api_error(str(exc))
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        _release_session_api_reservation(safe_profile, safe_session_id, reservation)
+        return _session_api_error(_redact_error(exc))
+
+
+
+def hermes_session_send(
+    session_id: str, prompt: str,
+    max_job_runtime_seconds: Annotated[int, Field(
+        description="Maximum run duration in seconds; separate from hermes_session_job_wait (bounded to 120 seconds).", ge=op_session.MIN_JOB_RUNTIME_SECONDS,
+        le=DEFAULT_SESSION_MAX_RUNTIME_SECONDS,
+    )] = DEFAULT_SESSION_MAX_RUNTIME_SECONDS,
+    profile: str = "default", mission_id: str = "",
+) -> dict[str, Any]:
+    """Alias for official API session continuation."""
+    return hermes_session_continue(session_id, prompt, max_job_runtime_seconds, profile, mission_id)
 
 
 def hermes_session_create(
     prompt: str,
-    max_job_runtime_seconds: Annotated[
-        int,
-        Field(
-            description=(
-                "Durée maximale du travail Hermes en secondes : à expiration, Hermes"
-                " et ses enfants sont arrêtés. Borne de 10 à 7200 inclus."
-            ),
-            ge=op_session.MIN_JOB_RUNTIME_SECONDS,
-            le=DEFAULT_SESSION_MAX_RUNTIME_SECONDS,
-        ),
-    ] = DEFAULT_SESSION_MAX_RUNTIME_SECONDS,
-    profile: str = "default",
-    title: str | None = None,
-    mission_id: Annotated[
-        str,
-        Field(description="Optional Mission ID for the terminal session/job wake-up event."),
-    ] = "",
+    max_job_runtime_seconds: Annotated[int, Field(
+        description="Maximum run duration in seconds; separate from hermes_session_job_wait (bounded to 120 seconds).", ge=op_session.MIN_JOB_RUNTIME_SECONDS,
+        le=DEFAULT_SESSION_MAX_RUNTIME_SECONDS,
+    )] = DEFAULT_SESSION_MAX_RUNTIME_SECONDS,
+    profile: str = "default", title: str | None = None, mission_id: str = "",
 ) -> dict[str, Any]:
-    """Create a new Hermes session and start its first work asynchronously.
-
-    Creates a genuinely new, distinct session in the target profile and runs
-    its first prompt through the same job machinery as
-    ``hermes_session_continue``. Follow with ``hermes_session_job_wait`` then
-    ``hermes_session_job_result``.
-    """
-    safe_profile = _validate_session_profile(profile)
+    """Create a session then submit its first turn through the official API."""
+    checked = op_session._validate_create(
+        prompt, max_job_runtime_seconds, profile, title, mission_id
+    )
+    if isinstance(checked, dict):
+        return checked
+    safe_prompt, safe_timeout, safe_profile, safe_title, safe_mission_id = checked
+    reservation = None
+    session_id = ""
     try:
-        require_imports()
-        if not env_enabled(ENABLE_SESSION_CONTROL_ENV):
-            return op_policy.make_error_envelope(
-                layer="session_control",
-                code="SESSION_CONTROL_DISABLED",
-                safe_message="Hermes session control is disabled.",
-                suggested_action=f"Set {ENABLE_SESSION_CONTROL_ENV}=1 on the trusted local MCP server.",
-            )
-        return op_session.hermes_session_create(
-            prompt,
-            max_job_runtime_seconds=max_job_runtime_seconds,
-            hermes_root=_default_hermes_root(),
-            agent_root=HERMES_ROOT,
-            profile=safe_profile,
-            title=title,
-            mission_id=mission_id,
+        client = HermesAPIClient()
+        created = client.create_session(title=safe_title, source="hermes-gpt", profile=safe_profile)
+        session = created.get("session")
+        session_id = session.get("id") if isinstance(session, dict) else None
+        session_id = session_id or created.get("session_id", created.get("id"))
+        if not isinstance(session_id, str) or not session_id:
+            return _session_api_error("Hermes API returned an invalid session response.")
+        reservation = _reserve_session_api_session(safe_profile, session_id)
+        if reservation is None:
+            return _session_api_error("A run is already active for this session.", "SESSION_BUSY")
+        run = client.create_run(safe_prompt, session_id=session_id, profile=safe_profile)
+        return _session_api_started(
+            run, session_id, safe_profile, client, safe_timeout, safe_mission_id, reservation
         )
-    except _SESSION_ERRORS as exc:
-        return op_policy.make_error_envelope(
-            layer="session_control",
-            code="SESSION_CREATE_FAILED",
-            safe_message=_redact_error(exc),
-            suggested_action="Check the Hermes session database, profile, and local CLI installation.",
-        )
+    except HermesAPIError as exc:
+        if reservation is not None:
+            _release_session_api_reservation(safe_profile, session_id, reservation)
+        return _session_api_error(str(exc))
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        if reservation is not None:
+            _release_session_api_reservation(safe_profile, session_id, reservation)
+        return _session_api_error(_redact_error(exc))
 
 
-def hermes_session_job_status(job_id: str) -> dict[str, Any]:
-    """Return bounded metadata for a Hermes session-control job."""
-    return op_session.hermes_session_job_status(job_id, _default_hermes_root())
+
+def hermes_session_job_status(job_id: str, profile: str = "default") -> dict[str, Any]:
+    """Read official run status or a legacy local job in read-only mode."""
+    if not _session_api_run_id(job_id):
+        return op_session.hermes_session_job_status(job_id, _default_hermes_root())
+    try:
+        safe_profile = _validate_session_profile(profile)
+        return _session_api_view(job_id, HermesAPIClient().get_run(job_id, profile=safe_profile), safe_profile)
+    except HermesAPIError as exc:
+        return _session_api_error(str(exc))
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return _session_api_error(_redact_error(exc))
 
 
 def hermes_session_job_result(
-    job_id: str, max_chars: int = op_session.MAX_RESULT_CHARS
+    job_id: str, max_chars: int = op_session.MAX_RESULT_CHARS, profile: str = "default"
 ) -> dict[str, Any]:
-    """Return the bounded, redacted response from a Hermes session-control job."""
-    return op_session.hermes_session_job_result(job_id, max_chars, _default_hermes_root())
+    """Read official run output or the legacy local job result."""
+    if not _session_api_run_id(job_id):
+        return op_session.hermes_session_job_result(job_id, max_chars, _default_hermes_root())
+    try:
+        safe_profile = _validate_session_profile(profile)
+        view = _session_api_view(job_id, HermesAPIClient().get_run(job_id, profile=safe_profile), safe_profile)
+        output = view["response"]
+        if not isinstance(output, str):
+            output = json.dumps(output, ensure_ascii=False)
+        cap = max(0, min(int(max_chars), op_session.MAX_RESULT_CHARS))
+        view.update(response=output[:cap], truncated=len(output) > cap)
+        return view
+    except HermesAPIError as exc:
+        return _session_api_error(str(exc))
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return _session_api_error(_redact_error(exc))
 
 
-def hermes_session_job_result_page(
-    job_id: str, offset: int = 0, max_bytes: int = 4096
-) -> dict[str, Any]:
-    """Return one page (byte range, UTF-8 safe) of a session-control job result."""
+def hermes_session_job_result_page(job_id: str, offset: int = 0, max_bytes: int = 4096) -> dict[str, Any]:
+    """Read a legacy session-job result page."""
     return op_session.hermes_session_job_result_page(job_id, offset, max_bytes, _default_hermes_root())
 
 
 def hermes_session_job_wait(
-    job_id: str, wait_seconds: int = op_session.MAX_JOB_WAIT_SECONDS
+    job_id: str, wait_seconds: int = op_session.MAX_JOB_WAIT_SECONDS, profile: str = "default"
 ) -> dict[str, Any]:
-    """Long-poll a Hermes session-control job to terminal state (max 120s)."""
-    return op_session.hermes_session_job_wait(job_id, wait_seconds, _default_hermes_root())
+    """Wait boundedly for an official API run or a legacy job."""
+    if not _session_api_run_id(job_id):
+        return op_session.hermes_session_job_wait(job_id, wait_seconds, _default_hermes_root())
+    import time
+    try:
+        seconds = max(0.0, min(float(wait_seconds), op_session.MAX_JOB_WAIT_SECONDS))
+    except (TypeError, ValueError):
+        seconds = float(op_session.MAX_JOB_WAIT_SECONDS)
+    started = time.monotonic()
+    deadline = started + seconds
+    try:
+        safe_profile = _validate_session_profile(profile)
+        client = HermesAPIClient()
+        while True:
+            view = _session_api_view(job_id, client.get_run(job_id, profile=safe_profile), safe_profile)
+            terminal = view["status"] in {"completed", "failed", "cancelled", "interrupted"}
+            if terminal or time.monotonic() >= deadline:
+                view["await"] = {"timed_out": not terminal, "wait_seconds": seconds,
+                                 "elapsed_ms": int((time.monotonic() - started) * 1000)}
+                return view
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+    except HermesAPIError as exc:
+        return _session_api_error(str(exc))
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return _session_api_error(_redact_error(exc))
 
 
 # ---------------------------------------------------------------------------

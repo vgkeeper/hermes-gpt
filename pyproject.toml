@@ -96,6 +96,7 @@ py-modules = [
   "updater",
   "versioning",
   "hermes_state",
+  "hermes_api_client",
 ]
 
 [tool.setuptools.data-files]
