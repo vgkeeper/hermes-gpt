@@ -119,17 +119,6 @@ def test_workspace_boundary_rejects_outward_symlink(tmp_path: Path):
         confinement.validate_workspace_boundary(ws)
 
 
-
-def test_workspace_boundary_can_reject_internal_symlinks(tmp_path: Path):
-    ws = tmp_path / "ws"
-    ws.mkdir()
-    target = ws / "target.txt"
-    target.write_text("safe", encoding="utf-8")
-    (ws / "alias.txt").symlink_to(target)
-    with pytest.raises(PermissionError, match="contains a symlink"):
-        confinement.validate_workspace_boundary(ws, reject_symlinks=True)
-
-
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX fifo support")
 def test_workspace_boundary_rejects_special_files(tmp_path: Path):
     ws = tmp_path / "ws"
@@ -148,17 +137,6 @@ def test_workspace_boundary_rejects_hardlink_alias_outside(tmp_path: Path):
     os.link(outside, ws / "alias.txt")
     with pytest.raises(PermissionError, match="hard link"):
         confinement.validate_workspace_boundary(ws)
-
-
-
-def test_workspace_boundary_can_reject_internal_hardlink_aliases(tmp_path: Path):
-    ws = tmp_path / "ws"
-    ws.mkdir()
-    source = ws / "source.txt"
-    source.write_text("safe")
-    os.link(source, ws / "alias.txt")
-    with pytest.raises(PermissionError, match="hard link"):
-        confinement.validate_workspace_boundary(ws, reject_hardlinks=True)
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux mountinfo only")

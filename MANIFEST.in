@@ -35,8 +35,6 @@ prune docs/design
 prune docs/releases
 prune logs
 prune dist
-prune deploy/opencode
-
 prune build
 prune tmp-operator-test
 prune __pycache__

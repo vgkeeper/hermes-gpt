@@ -18,31 +18,25 @@ backend names; contracts select them with ``execution.backend``.
 
 from __future__ import annotations
 
-import base64
 import hmac
 import http.client
 import importlib.metadata
-import ipaddress
 import json
 import logging
 import os
-import queue
 import re
 import secrets
 import selectors
 import shutil
 import signal
-import socket
 import subprocess
 import sys
-import tempfile
 import threading
-import time
 import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Protocol
 
 import operator_fleet as op_fleet
@@ -56,38 +50,10 @@ RUNNER_PLUGIN_ALLOWLIST_ENV = "HERMES_GPT_RUNNER_PLUGIN_ALLOWLIST"
 RUNNER_BACKEND_ALLOWLIST_ENV = "HERMES_GPT_RUNNER_BACKEND_ALLOWLIST"
 RUNNER_PROVIDER_ALLOWLIST_ENV = "HERMES_GPT_RUNNER_PROVIDER_ALLOWLIST"
 RUNNER_MODEL_ALLOWLIST_ENV = "HERMES_GPT_RUNNER_MODEL_ALLOWLIST"
-OPENCODE_REMOTE_ENABLE_ENV = "HERMES_GPT_OPENCODE_REMOTE_ENABLED"
-OPENCODE_REMOTE_PASSWORD_ENV = "HERMES_GPT_OPENCODE_SERVER_PASSWORD"
-OPENCODE_REMOTE_USERNAME_ENV = "HERMES_GPT_OPENCODE_SERVER_USERNAME"
-OPENCODE_REMOTE_HOST = "hermes-opencode"
-OPENCODE_REMOTE_PORT = 4097
-OPENCODE_REMOTE_SUPPORTED_VERSION = "1.18.35"
-OPENCODE_REMOTE_PROVIDER = "hermes-proxy"
-OPENCODE_REMOTE_MODEL_ID = "openai/gpt-6-luna"
-OPENCODE_REMOTE_MODEL = f"{OPENCODE_REMOTE_PROVIDER}/{OPENCODE_REMOTE_MODEL_ID}"
-OPENCODE_REMOTE_WORKSPACE_PATH = "/workspaces"
-OPENCODE_REMOTE_MARKER_NAME = ".hermes-gpt-opencode-workspace"
-OPENCODE_REMOTE_MARKER_VALUE = "hermes-gpt-opencode-workspace-v1"
-OPENCODE_REMOTE_AGENT = "hermes-readonly"
-_OPENCODE_REMOTE_DENIED_TOOLS = (
-    "bash", "edit", "write", "patch", "apply_patch", "webfetch", "task", "external_directory",
-    "websearch", "question", "todowrite", "lsp", "mcp", "skill",
-)
-_OPENCODE_REMOTE_SECRET_PATTERNS = (
-    "*.env", "*.env.*", "*.envrc", "*auth.json", "*auth.lock", "*credentials*", "*google_oauth.json",
-    "*anthropic_oauth.json", "*git-credentials*", "*.npmrc", "*.pypirc", "*.netrc", "*.pgpass",
-    "*mcp-tokens*", "*pairing*", "*vault*", "*secrets*", "*.ssh*",
-    "*.aws*", "*.gnupg*", "*.kube*", "*.docker*", "*.azure*", "*token*", "*secret*",
-    "*credential*", "*oauth*", "*cookie*", "*private*", "*password*", "*passwd*", "*.key*",
-    "*id_rsa*", "*id_ed25519*", "*authorized_keys*",
-)
 _BACKEND_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _TASK_ID_RE = op_fleet._TASK_ID_RE
-_OPENCODE_SESSION_ID_RE = re.compile(r"^ses[A-Za-z0-9_-]{1,128}$")
 _MAX_OPTIONS_BYTES = 8_000
 _MAX_RESULT_CHARS = 8_000
-_MAX_OPENCODE_REMOTE_RESPONSE = 256 * 1024
-_OPENCODE_REMOTE_TIMEOUT = 3.0
 _TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
 logger = logging.getLogger(__name__)
 
@@ -762,13 +728,11 @@ class _LocalProcessBackend:
         meta_path, request_path, log_path = _job_paths(task_id, hermes_root)
         if meta_path.exists():
             return {"success": False, "code": "RUNNER_JOB_EXISTS", "backend": self.name, "safe_message": f"runner job {task_id!r} already exists"}
-        remote_mode = self.name == "opencode" and _opencode_remote_enabled()
         request = {
             "backend": self.name,
             "contract": contract,
             "timeout": max(10, min(int(timeout), 3600)),
             "hermes_root": str((hermes_root or Path.home() / ".hermes").expanduser()),
-            "remote_mode": remote_mode,
         }
         _atomic_json(request_path, request)
         meta = {
@@ -784,7 +748,6 @@ class _LocalProcessBackend:
             "pid": None,
             "returncode": None,
             "error": "",
-            "remote_mode": remote_mode,
         }
         _atomic_json(meta_path, meta)
         job_supervisor.register_job(
@@ -849,7 +812,7 @@ class _LocalProcessBackend:
         meta = _load_json(meta_path)
         if not meta or meta.get("backend") != self.name:
             return []
-        observation = {
+        return [{
             "task_id": task_id,
             "status": meta.get("state"),
             "outcome": meta.get("outcome") or meta.get("state"),
@@ -857,13 +820,7 @@ class _LocalProcessBackend:
             "started_at": meta.get("started_at") or meta.get("created_at"),
             "ended_at": meta.get("ended_at"),
             "scope": f"runner:{self.name}",
-        }
-        if self.name == "opencode" and meta.get("remote_mode") is True and isinstance(meta.get("remote_result"), str):
-            observation["result"] = _bounded_text(meta["remote_result"])
-        remote_session_id = meta.get("remote_session_id")
-        if self.name == "opencode" and isinstance(remote_session_id, str) and _OPENCODE_SESSION_ID_RE.fullmatch(remote_session_id):
-            observation["session_id"] = remote_session_id
-        return [observation]
+        }]
 
     def cancel(self, task_id: str, *, hermes_root: Path | None = None) -> dict[str, Any]:
         meta_path, _, _ = _job_paths(task_id, hermes_root)
@@ -1149,360 +1106,6 @@ def _opencode_child_config(material: dict[str, Any], proxy_port: int) -> str:
     )
 
 
-class _OpenCodeRemoteError(RuntimeError):
-    pass
-
-
-def _opencode_remote_enabled() -> bool:
-    return op.env_truthy(OPENCODE_REMOTE_ENABLE_ENV)
-
-
-def _opencode_remote_workspace_root() -> Path:
-    return Path("/opt/data/opencode-workspaces")
-
-
-
-def _opencode_remote_password() -> str:
-    password = os.environ.get(OPENCODE_REMOTE_PASSWORD_ENV, "")
-    if not password or len(password) > 4096 or "\r" in password or "\n" in password:
-        raise _OpenCodeRemoteError("OpenCode remote Basic authentication is unavailable")
-    return password
-
-
-def _opencode_remote_url() -> str:
-    return f"http://{OPENCODE_REMOTE_HOST}:{OPENCODE_REMOTE_PORT}"
-
-
-def _opencode_remote_private_host() -> bool:
-    try:
-        addresses = socket.getaddrinfo(OPENCODE_REMOTE_HOST, OPENCODE_REMOTE_PORT, type=socket.SOCK_STREAM)
-    except OSError:
-        return False
-    if not addresses:
-        return False
-    for address in addresses:
-        try:
-            ip = ipaddress.ip_address(address[4][0])
-        except (ValueError, IndexError):
-            return False
-        if not ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
-            return False
-    return True
-
-
-def _opencode_remote_request(
-    method: str,
-    path: str,
-    *,
-    body: dict[str, Any] | None = None,
-    authenticated: bool = True,
-) -> Any:
-    if not path.startswith("/") or "\r" in path or "\n" in path:
-        raise _OpenCodeRemoteError("OpenCode remote probe failed")
-    if not _opencode_remote_private_host():
-        raise _OpenCodeRemoteError("OpenCode remote service did not resolve to a private address")
-    headers = {"Accept": "application/json", "Connection": "close"}
-    if authenticated:
-        password = _opencode_remote_password()
-        username = os.environ.get(OPENCODE_REMOTE_USERNAME_ENV, "opencode")
-        if not username or len(username) > 128 or any(char in username for char in ":\r\n"):
-            raise _OpenCodeRemoteError("OpenCode remote Basic authentication is unavailable")
-        basic = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
-        headers["Authorization"] = f"Basic {basic}"
-    if body is not None:
-        headers["Content-Type"] = "application/json"
-    connection = http.client.HTTPConnection(
-        OPENCODE_REMOTE_HOST,
-        OPENCODE_REMOTE_PORT,
-        timeout=_OPENCODE_REMOTE_TIMEOUT,
-    )
-    try:
-        encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":")) if body is not None else None
-        connection.request(method, path, body=encoded, headers=headers)
-        response = connection.getresponse()
-        if not authenticated:
-            response.read(_MAX_OPENCODE_REMOTE_RESPONSE)
-            if response.status == 401:
-                return {"unauthenticated": True}
-            raise _OpenCodeRemoteError("OpenCode remote Basic authentication is not enforced")
-        if response.status < 200 or response.status >= 300:
-            raise _OpenCodeRemoteError("OpenCode remote probe was rejected")
-        raw = response.read(_MAX_OPENCODE_REMOTE_RESPONSE + 1)
-        if len(raw) > _MAX_OPENCODE_REMOTE_RESPONSE:
-            raise _OpenCodeRemoteError("OpenCode remote response exceeded its limit")
-        if not raw:
-            return None
-        try:
-            return json.loads(raw.decode("utf-8"))
-        except (UnicodeError, ValueError) as exc:
-            raise _OpenCodeRemoteError("OpenCode remote response was invalid") from exc
-    except _OpenCodeRemoteError:
-        raise
-    except (OSError, http.client.HTTPException, UnicodeError, ValueError) as exc:
-        raise _OpenCodeRemoteError("OpenCode remote service is unavailable") from exc
-    finally:
-        connection.close()
-
-
-def _opencode_permission_action(rules: Any, permission: str, pattern: str) -> str:
-    if not isinstance(rules, list):
-        return "ask"
-
-    def _match(value: str, mask: str) -> bool:
-        expression = re.escape(mask.replace("\\", "/")).replace(r"\*", ".*").replace(r"\?", ".")
-        return re.fullmatch(expression, value.replace("\\", "/"), flags=re.DOTALL) is not None
-
-    for rule in reversed(rules):
-        if not isinstance(rule, dict):
-            continue
-        rule_permission = rule.get("permission")
-        rule_pattern = rule.get("pattern")
-        action = rule.get("action")
-        if (
-            isinstance(rule_permission, str)
-            and isinstance(rule_pattern, str)
-            and action in {"allow", "ask", "deny"}
-            and _match(permission, rule_permission)
-            and _match(pattern, rule_pattern)
-        ):
-            return action
-    return "ask"
-
-
-def _opencode_remote_rules_safe(rules: Any, *, scope: str) -> bool:
-    if not isinstance(rules, list) or not rules:
-        return False
-    if not any(
-        rule.get("permission") == "*" and rule.get("pattern") == "*" and rule.get("action") == "deny"
-        for rule in rules if isinstance(rule, dict)
-    ):
-        return False
-    if _opencode_permission_action(rules, "hermes-unlisted-tool", "*") != "deny":
-        return False
-    if any(
-        _opencode_permission_action(rules, tool, "*") != "deny"
-        for tool in _OPENCODE_REMOTE_DENIED_TOOLS
-    ):
-        return False
-    allowed_read_tools = ("read", "glob", "grep", "list")
-    if any(_opencode_permission_action(rules, tool, "*") != "allow" for tool in allowed_read_tools):
-        return False
-    denied_paths = (
-        "../outside.txt", "../../etc/passwd", "/proc/self/environ", "/proc/**", ".env", ".env.local",
-        ".env.production", "auth.json", "credentials", ".ssh/id_rsa", ".aws/credentials",
-        "vault/secret.json", "mcp-tokens/access.json", *_OPENCODE_REMOTE_SECRET_PATTERNS,
-    )
-    for tool in allowed_read_tools:
-        if any(_opencode_permission_action(rules, tool, path) != "deny" for path in denied_paths):
-            return False
-        if _opencode_permission_action(rules, tool, "src/main.py") != "allow":
-            return False
-    if any(
-        _opencode_permission_action(rules, "external_directory", sample) != "deny"
-        for sample in ("/proc/self/*", "/etc/*", "/workspaces/sibling/*", "../outside/*")
-    ):
-        return False
-    return scope == OPENCODE_REMOTE_WORKSPACE_PATH
-
-
-def _opencode_remote_verify_directory(remote_path: str) -> dict[str, Any]:
-    if (
-        not isinstance(remote_path, str)
-        or not remote_path.startswith(OPENCODE_REMOTE_WORKSPACE_PATH)
-        or (remote_path != OPENCODE_REMOTE_WORKSPACE_PATH and not remote_path.startswith(OPENCODE_REMOTE_WORKSPACE_PATH + "/"))
-        or ".." in PurePosixPath(remote_path).parts
-        or PurePosixPath(remote_path).as_posix() != remote_path
-        or "\\" in remote_path
-    ):
-        raise _OpenCodeRemoteError("OpenCode remote workspace path is invalid")
-    path_info = _opencode_remote_request(
-        "GET",
-        "/path?" + urllib.parse.urlencode({"directory": remote_path}),
-    )
-    if (
-        not isinstance(path_info, dict)
-        or path_info.get("directory") != remote_path
-        or path_info.get("worktree") != remote_path
-    ):
-        raise _OpenCodeRemoteError("OpenCode remote project root is wider than the authorized workspace")
-    return path_info
-
-
-def _opencode_remote_verify_mount_root(remote_path: str) -> dict[str, Any]:
-    """Verify the mount root itself; project worktree scope is checked per contract."""
-    path_info = _opencode_remote_request(
-        "GET",
-        "/path?" + urllib.parse.urlencode({"directory": remote_path}),
-    )
-    if not isinstance(path_info, dict) or path_info.get("directory") != remote_path:
-        raise _OpenCodeRemoteError("OpenCode shared workspace mount root is not verified")
-    return path_info
-
-
-
-def _opencode_remote_preflight(*, root: Path | None = None) -> dict[str, Any]:
-    if not _opencode_remote_enabled():
-        raise _OpenCodeRemoteError("OpenCode remote mode is not enabled")
-    if os.environ.get("HERMES_GPT_OPENCODE_REMOTE_HARDENED", "").strip() != "1":
-        raise _OpenCodeRemoteError("OpenCode remote hardening has not been acknowledged")
-    password = _opencode_remote_password()
-    del password
-    root = root or _opencode_remote_workspace_root()
-    try:
-        configured_root = root.expanduser().absolute()
-        root = configured_root.resolve(strict=True)
-        if root != configured_root:
-            raise PermissionError("configured workspace root resolves through a symlink")
-        confinement.validate_workspace_boundary(root, reject_symlinks=True, reject_hardlinks=True)
-    except (OSError, PermissionError, RuntimeError) as exc:
-        raise _OpenCodeRemoteError("OpenCode shared workspace root is not safely accessible") from exc
-    if op.is_denied_path(root):
-        raise _OpenCodeRemoteError("OpenCode shared workspace root is denied by the secret-path policy")
-    entries = 0
-    try:
-        for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
-            for name in [*dirs, *files]:
-                entries += 1
-                if entries > 200_000:
-                    raise _OpenCodeRemoteError("OpenCode shared workspace exceeds its scan limit")
-                if op.is_denied_path(Path(current) / name):
-                    raise _OpenCodeRemoteError("OpenCode shared workspace contains a denied secret path")
-    except OSError as exc:
-        raise _OpenCodeRemoteError("OpenCode shared workspace could not be scanned") from exc
-    if not (root / OPENCODE_REMOTE_MARKER_NAME).is_file():
-        raise _OpenCodeRemoteError("OpenCode shared workspace marker is missing or denied")
-    try:
-        marker = (root / OPENCODE_REMOTE_MARKER_NAME).read_text(encoding="utf-8")
-    except OSError as exc:
-        raise _OpenCodeRemoteError("OpenCode shared workspace marker is unreadable") from exc
-    if marker != OPENCODE_REMOTE_MARKER_VALUE + "\n":
-        raise _OpenCodeRemoteError("OpenCode shared workspace marker is invalid")
-
-    unauthenticated = _opencode_remote_request("GET", "/global/health", authenticated=False)
-    if unauthenticated != {"unauthenticated": True}:
-        raise _OpenCodeRemoteError("OpenCode remote Basic authentication is not enforced")
-    health = _opencode_remote_request("GET", "/global/health")
-    if (
-        not isinstance(health, dict)
-        or health.get("healthy") is not True
-        or health.get("version") != OPENCODE_REMOTE_SUPPORTED_VERSION
-    ):
-        raise _OpenCodeRemoteError("OpenCode remote health check failed")
-    remote_marker = _opencode_remote_request(
-        "GET",
-        "/file/content?" + urllib.parse.urlencode(
-            {"directory": OPENCODE_REMOTE_WORKSPACE_PATH, "path": OPENCODE_REMOTE_MARKER_NAME}
-        ),
-    )
-    remote_marker_content = remote_marker.get("content") if isinstance(remote_marker, dict) else None
-    if remote_marker_content not in (OPENCODE_REMOTE_MARKER_VALUE, OPENCODE_REMOTE_MARKER_VALUE + "\n"):
-        raise _OpenCodeRemoteError("OpenCode shared workspace mapping is not verified")
-    _opencode_remote_verify_mount_root(OPENCODE_REMOTE_WORKSPACE_PATH)
-    config = _opencode_remote_request(
-        "GET",
-        "/config?" + urllib.parse.urlencode({"directory": OPENCODE_REMOTE_WORKSPACE_PATH}),
-    )
-    if (
-        not isinstance(config, dict)
-        or config.get("default_agent") != OPENCODE_REMOTE_AGENT
-        or config.get("model") != OPENCODE_REMOTE_MODEL
-    ):
-        raise _OpenCodeRemoteError("OpenCode remote default agent/model is not safely configured")
-    agents = _opencode_remote_request(
-        "GET",
-        "/agent?" + urllib.parse.urlencode({"directory": OPENCODE_REMOTE_WORKSPACE_PATH}),
-    )
-    if not isinstance(agents, list):
-        raise _OpenCodeRemoteError("OpenCode read-only agent is not verifiable")
-    agent = next((item for item in agents if isinstance(item, dict) and item.get("name") == OPENCODE_REMOTE_AGENT), None)
-    if (
-        not agent
-        or agent.get("mode") != "primary"
-        or not isinstance(agent.get("model"), dict)
-        or agent["model"].get("providerID") != OPENCODE_REMOTE_PROVIDER
-        or agent["model"].get("modelID") != OPENCODE_REMOTE_MODEL_ID
-        or not _opencode_remote_rules_safe(agent.get("permission"), scope=OPENCODE_REMOTE_WORKSPACE_PATH)
-    ):
-        raise _OpenCodeRemoteError("OpenCode remote agent is not safely configured")
-    return {"agent": agent, "root": root}
-
-
-def _opencode_remote_workspace(contract: dict[str, Any], root: Path) -> tuple[Path, str]:
-    workspaces = contract.get("allowed_scope", {}).get("workspaces") or []
-    if not isinstance(workspaces, list) or len(workspaces) != 1 or not isinstance(workspaces[0], str):
-        raise _OpenCodeRemoteError("OpenCode remote execution requires exactly one allowed workspace")
-    raw = Path(workspaces[0]).expanduser()
-    try:
-        workspace = raw.resolve(strict=True)
-        relative = workspace.relative_to(root)
-        if raw.absolute() != workspace:
-            raise ValueError
-        confinement.validate_workspace_boundary(workspace, reject_symlinks=True, reject_hardlinks=True)
-    except (OSError, ValueError, PermissionError, RuntimeError) as exc:
-        raise _OpenCodeRemoteError("OpenCode workspace is outside its verified shared root") from exc
-    if op.is_denied_path(workspace):
-        raise _OpenCodeRemoteError("OpenCode workspace is denied by the secret-path policy")
-    remote_path = PurePosixPath(OPENCODE_REMOTE_WORKSPACE_PATH, *relative.parts).as_posix()
-    if (
-        remote_path != OPENCODE_REMOTE_WORKSPACE_PATH
-        and not remote_path.startswith(OPENCODE_REMOTE_WORKSPACE_PATH + "/")
-    ) or ".." in PurePosixPath(remote_path).parts:
-        raise _OpenCodeRemoteError("OpenCode workspace mapping is invalid")
-    return workspace, remote_path
-
-
-def _opencode_remote_model(agent: dict[str, Any], requested: Any) -> str:
-    model = str(requested or "").strip()
-    if model:
-        if "/" not in model:
-            raise ValueError("OpenCode requires a provider/model selection")
-        provider, _model_id = model.split("/", 1)
-    else:
-        configured = agent.get("model")
-        if not isinstance(configured, dict) or not isinstance(configured.get("modelID"), str):
-            raise _OpenCodeRemoteError("OpenCode read-only agent has no pinned model")
-        provider = str(configured.get("providerID") or "")
-        model = f"{provider}/{configured['modelID']}"
-    if provider != OPENCODE_REMOTE_PROVIDER or not _allowed_by_env(provider, RUNNER_PROVIDER_ALLOWLIST_ENV):
-        raise PermissionError("OpenCode provider is not allowed by the remote runner policy")
-    if model != OPENCODE_REMOTE_MODEL or not _allowed_by_env(model, RUNNER_MODEL_ALLOWLIST_ENV):
-        raise PermissionError("OpenCode model is not allowed by the remote runner policy")
-    return model
-
-
-def _opencode_remote_session(session_id: str, remote_path: str) -> dict[str, Any]:
-    if not _OPENCODE_SESSION_ID_RE.fullmatch(session_id):
-        raise ValueError("OpenCode session_id has an invalid format")
-    session = _opencode_remote_request(
-        "GET",
-        f"/session/{urllib.parse.quote(session_id, safe='')}?" + urllib.parse.urlencode({"directory": remote_path}),
-    )
-    if not isinstance(session, dict) or session.get("id") != session_id:
-        raise _OpenCodeRemoteError("OpenCode session is unavailable")
-    if session.get("agent") != OPENCODE_REMOTE_AGENT or session.get("directory") != remote_path:
-        raise _OpenCodeRemoteError("OpenCode session does not match the read-only workspace")
-    session_model = session.get("model")
-    if (
-        not isinstance(session_model, dict)
-        or session_model.get("providerID") != OPENCODE_REMOTE_PROVIDER
-        or session_model.get("modelID") != OPENCODE_REMOTE_MODEL_ID
-    ):
-        raise _OpenCodeRemoteError("OpenCode session provider/model is not verifiable")
-    if session.get("permission") is not None and not _opencode_remote_rules_safe(
-        session.get("permission"), scope=OPENCODE_REMOTE_WORKSPACE_PATH
-    ):
-        raise _OpenCodeRemoteError("OpenCode session permissions are not safely configured")
-    return session
-
-
-def _opencode_remote_abort(session_id: str, remote_path: str) -> None:
-    _opencode_remote_request(
-        "POST",
-        f"/session/{urllib.parse.quote(session_id, safe='')}/abort?" + urllib.parse.urlencode({"directory": remote_path}),
-    )
-
-
-
 @dataclass
 class OpenCodeBackend(_LocalProcessBackend):
     name: str = "opencode"
@@ -1515,68 +1118,10 @@ class OpenCodeBackend(_LocalProcessBackend):
                 return str(Path(candidate).resolve())
         return None
 
-    def availability(self, *, hermes_root: Path | None = None) -> dict[str, Any]:
-        exe = self.executable()
-        if not _opencode_remote_enabled():
-            return {"available": bool(exe), "executable": exe}
-        if not exe:
-            return {"available": False, "remote": True, "reason": "OpenCode CLI executable not found"}
-        try:
-            remote = _opencode_remote_preflight()
-            _opencode_remote_model(remote["agent"], None)
-        except Exception as exc:  # noqa: BLE001
-            return {"available": False, "remote": True, "reason": _bounded_text(exc, 200)}
-        return {"available": True, "remote": True, "executable": exe}
-
     def build_plan(self, contract: dict[str, Any]) -> dict[str, Any]:
         options = ((contract.get("execution") or {}).get("options") or {})
         sandbox = _sandbox_for(contract, backend="opencode")
         writable = sandbox == "workspace-write"
-        if _opencode_remote_enabled():
-            authorization = contract.get("authorization") or {}
-            if authorization.get("class") != "read_only" or authorization.get("approved") is not True:
-                raise PermissionError("OpenCode remote mode accepts only approved read_only Work Contracts")
-            if writable:
-                raise PermissionError("OpenCode remote mode is read-only; workspace-write is denied")
-            if options.get("agent") not in (None, "", OPENCODE_REMOTE_AGENT):
-                raise PermissionError("OpenCode remote mode forces the hermes-readonly agent")
-            remote = _opencode_remote_preflight()
-            _workspace, remote_path = _opencode_remote_workspace(contract, remote["root"])
-            _opencode_remote_verify_directory(remote_path)
-            model = _opencode_remote_model(remote["agent"], options.get("model"))
-            session_id = str(options.get("session_id") or "").strip()
-            if session_id:
-                session = _opencode_remote_session(session_id, remote_path)
-                session_model = session.get("model")
-                if isinstance(session_model, dict):
-                    session_provider = str(session_model.get("providerID") or "")
-                    session_model_id = str(session_model.get("modelID") or "")
-                    if (
-                        session_provider != OPENCODE_REMOTE_PROVIDER
-                        or session_model_id != OPENCODE_REMOTE_MODEL_ID
-                        or not _allowed_by_env(session_provider, RUNNER_PROVIDER_ALLOWLIST_ENV)
-                    ):
-                        raise PermissionError("OpenCode session provider is not allowed by the remote runner policy")
-                    session_model_name = f"{session_provider}/{session_model_id}"
-                    if not _allowed_by_env(session_model_name, RUNNER_MODEL_ALLOWLIST_ENV):
-                        raise PermissionError("OpenCode session model is not allowed by the remote runner policy")
-                    if options.get("model") and model != session_model_name:
-                        raise ValueError("OpenCode session model does not match execution.options.model")
-                    model = session_model_name
-            variant = str(options.get("variant") or "").strip()
-            if len(variant) > 128:
-                raise ValueError("opencode variant option must be <= 128 characters")
-            return {
-                "mode": "remote-attach",
-                "format": "json",
-                "pure": True,
-                "sandbox": "read-only",
-                "workspace": remote_path,
-                "agent": OPENCODE_REMOTE_AGENT,
-                "model": model,
-                "variant": variant or None,
-                "session_id": session_id or None,
-            }
         if not confinement.confinement_available(writable=writable, expose_proc=True):
             posture = "write-capable" if writable else "read-only"
             raise PermissionError(
@@ -1600,41 +1145,6 @@ class OpenCodeBackend(_LocalProcessBackend):
             "agent": agent or None,
             "variant": variant or None,
         }
-
-    def cancel(self, task_id: str, *, hermes_root: Path | None = None) -> dict[str, Any]:
-        meta_path, _, _ = _job_paths(task_id, hermes_root)
-        meta = _load_json(meta_path)
-        if not meta or meta.get("backend") != self.name:
-            return {"success": False, "code": "RUNNER_JOB_NOT_FOUND", "backend": self.name}
-        if meta.get("remote_mode") is not True:
-            return super().cancel(task_id, hermes_root=hermes_root)
-        if meta.get("state") in _TERMINAL_STATES:
-            return super().cancel(task_id, hermes_root=hermes_root)
-        session_id = meta.get("remote_session_id")
-        remote_path = meta.get("remote_directory")
-        if (
-            not isinstance(session_id, str)
-            or not _OPENCODE_SESSION_ID_RE.fullmatch(session_id)
-            or not isinstance(remote_path, str)
-            or not (remote_path == OPENCODE_REMOTE_WORKSPACE_PATH or remote_path.startswith(OPENCODE_REMOTE_WORKSPACE_PATH + "/"))
-            or ".." in PurePosixPath(remote_path).parts
-        ):
-            return {
-                "success": False,
-                "code": "RUNNER_REMOTE_SESSION_UNAVAILABLE",
-                "backend": self.name,
-                "safe_message": "remote session identity is not available; cancellation was not claimed",
-            }
-        try:
-            _opencode_remote_abort(session_id, remote_path)
-        except Exception:  # noqa: BLE001
-            return {
-                "success": False,
-                "code": "RUNNER_REMOTE_CANCEL_FAILED",
-                "backend": self.name,
-                "safe_message": "OpenCode remote session could not be aborted; cancellation was not claimed",
-            }
-        return super().cancel(task_id, hermes_root=hermes_root)
 
 
 @dataclass
@@ -1848,227 +1358,6 @@ def _worker_pi(
         rc = int(proc.returncode or 124)
     return rc, final_text
 
-def _worker_opencode_remote(
-    exe: str,
-    contract: dict[str, Any],
-    timeout: int,
-    log_path: Path,
-    meta_path: Path,
-) -> tuple[int, str]:
-    options = ((contract.get("execution") or {}).get("options") or {})
-    authorization = contract.get("authorization") or {}
-    if authorization.get("class") != "read_only" or authorization.get("approved") is not True:
-        raise PermissionError("OpenCode remote mode accepts only approved read_only Work Contracts")
-    if options.get("agent") not in (None, "", OPENCODE_REMOTE_AGENT):
-        raise PermissionError("OpenCode remote mode forces the hermes-readonly agent")
-    if options.get("sandbox") not in (None, "read-only"):
-        raise PermissionError("OpenCode remote mode is read-only; workspace-write is denied")
-    remote = _opencode_remote_preflight()
-    _workspace, remote_path = _opencode_remote_workspace(contract, remote["root"])
-    _opencode_remote_verify_directory(remote_path)
-    model = _opencode_remote_model(remote["agent"], options.get("model"))
-    session_id = str(options.get("session_id") or "").strip()
-    if session_id:
-        session = _opencode_remote_session(session_id, remote_path)
-        session_model = session.get("model")
-        if not isinstance(session_model, dict):
-            raise _OpenCodeRemoteError("OpenCode session has no pinned model")
-        session_provider = session_model.get("providerID")
-        session_model_id = session_model.get("modelID")
-        session_model_name = f"{session_provider}/{session_model_id}"
-        if (
-            session_provider != OPENCODE_REMOTE_PROVIDER
-            or session_model_id != OPENCODE_REMOTE_MODEL_ID
-            or not _allowed_by_env(str(session_provider), RUNNER_PROVIDER_ALLOWLIST_ENV)
-            or session_model_name != OPENCODE_REMOTE_MODEL
-            or not _allowed_by_env(session_model_name, RUNNER_MODEL_ALLOWLIST_ENV)
-        ):
-            raise PermissionError("OpenCode session model is not allowed by the remote runner policy")
-        if options.get("model") and model != session_model_name:
-            raise ValueError("OpenCode session model does not match execution.options.model")
-        model = session_model_name
-
-    argv = [
-        exe,
-        "run",
-        "--format", "json",
-        "--pure",
-        "--attach", _opencode_remote_url(),
-        "--dir", remote_path,
-        "--model", model,
-        "--agent", OPENCODE_REMOTE_AGENT,
-    ]
-    variant = str(options.get("variant") or "").strip()
-    if variant:
-        if len(variant) > 128:
-            raise ValueError("opencode variant option must be <= 128 characters")
-        argv.extend(["--variant", variant])
-    if session_id:
-        argv.extend(["--session", session_id])
-
-    password = _opencode_remote_password()
-    username = os.environ.get(OPENCODE_REMOTE_USERNAME_ENV, "opencode")
-    if not username or len(username) > 128 or any(char in username for char in ":\r\n"):
-        raise _OpenCodeRemoteError("OpenCode remote Basic authentication is unavailable")
-    client_home = Path(tempfile.mkdtemp(prefix="hermes-opencode-client-"))
-    child_env = {
-        key: os.environ[key]
-        for key in ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "PYTHONIOENCODING")
-        if os.environ.get(key)
-    }
-    child_env["HOME"] = str(client_home)
-    child_env["TMPDIR"] = str(client_home)
-    child_env["TEMP"] = str(client_home)
-    child_env["TMP"] = str(client_home)
-    child_env["OPENCODE_SERVER_PASSWORD"] = password
-    child_env["OPENCODE_SERVER_USERNAME"] = username
-    try:
-        proc = _popen_process_group(
-            argv,
-            cwd=str(client_home),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            bufsize=1,
-            env=child_env,
-        )
-    except OSError as exc:
-        shutil.rmtree(client_home, ignore_errors=True)
-        raise RuntimeError("OpenCode remote client could not be started") from exc
-    assert proc.stdin is not None and proc.stdout is not None
-    try:
-        proc.stdin.write(contract["objective"])
-        proc.stdin.close()
-    except (OSError, ValueError) as exc:
-        _terminate_process_group(proc)
-        proc.stdout.close()
-        shutil.rmtree(client_home, ignore_errors=True)
-        raise RuntimeError("OpenCode remote client input could not be delivered") from exc
-
-    lines: queue.Queue[str | None] = queue.Queue(maxsize=32)
-    def _read_stdout() -> None:
-        try:
-            while True:
-                line = proc.stdout.readline(65_537)
-                if not line:
-                    break
-                if len(line) > 65_536 and not line.endswith("\n"):
-                    while line and not line.endswith("\n"):
-                        line = proc.stdout.readline(65_537)
-                    lines.put("__oversized_event__")
-                    continue
-                lines.put(line)
-        except (OSError, ValueError):
-            pass
-        finally:
-            lines.put(None)
-
-    reader = threading.Thread(target=_read_stdout, daemon=True)
-    reader.start()
-    deadline = time.monotonic() + max(1, min(int(timeout), 3600))
-    captured_session = session_id or ""
-    failed_event = False
-    timed_out = False
-    eof = False
-    final_parts: list[str] = []
-    final_size = 0
-    final_truncated = False
-
-    def _capture_text(value: Any) -> None:
-        nonlocal final_size, final_truncated
-        if not isinstance(value, str) or not value:
-            return
-        remaining = _MAX_RESULT_CHARS - final_size
-        if remaining > 0:
-            accepted = value[:remaining]
-            final_parts.append(accepted)
-            final_size += len(accepted)
-        if len(value) > remaining:
-            final_truncated = True
-
-    def _persist_session(value: str) -> None:
-        meta = _load_json(meta_path) or {}
-        existing = meta.get("remote_session_id")
-        if existing and existing != value:
-            raise _OpenCodeRemoteError("OpenCode remote client changed session unexpectedly")
-        meta.update({"remote_session_id": value, "remote_directory": remote_path})
-        _atomic_json(meta_path, meta)
-        _append_event(log_path, {"type": "session", "at": _now(), "session_id": value})
-
-    if captured_session:
-        _persist_session(captured_session)
-    try:
-        while not eof:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                timed_out = True
-                break
-            try:
-                line = lines.get(timeout=min(0.2, remaining))
-            except queue.Empty:
-                if proc.poll() is not None and not reader.is_alive():
-                    break
-                continue
-            if line is None:
-                eof = True
-                continue
-            if line == "__oversized_event__":
-                _append_event(log_path, {"type": "oversized_event", "at": _now()})
-                continue
-            try:
-                event = json.loads(line)
-            except (TypeError, ValueError):
-                _append_event(log_path, {"type": "invalid_event", "at": _now()})
-                continue
-            if not isinstance(event, dict):
-                continue
-            event_session = event.get("sessionID")
-            if isinstance(event_session, str) and _OPENCODE_SESSION_ID_RE.fullmatch(event_session):
-                if captured_session and captured_session != event_session:
-                    failed_event = True
-                    break
-                if not captured_session:
-                    captured_session = event_session
-                    _persist_session(captured_session)
-            event_type = event.get("type")
-            if event_type == "error":
-                failed_event = True
-            if event_type == "text" and event.get("sessionID") == captured_session:
-                part = event.get("part")
-                if isinstance(part, dict) and part.get("type") == "text":
-                    _capture_text(part.get("text"))
-            safe_type = event_type if event_type in {"step_start", "step_finish", "tool_use", "error", "text", "event"} else "event"
-            _append_event(log_path, {"type": safe_type, "at": _now()})
-    finally:
-        if timed_out or failed_event:
-            if captured_session:
-                try:
-                    _opencode_remote_abort(captured_session, remote_path)
-                except Exception:  # noqa: BLE001
-                    pass
-            _terminate_process_group(proc)
-        else:
-            try:
-                proc.wait(timeout=max(0.1, min(2.0, deadline - time.monotonic())))
-            except subprocess.TimeoutExpired:
-                _terminate_process_group(proc)
-                timed_out = True
-        reader.join(timeout=2)
-        proc.stdout.close()
-        shutil.rmtree(client_home, ignore_errors=True)
-    if timed_out:
-        _append_event(log_path, {"type": "timeout", "at": _now()})
-        return 124, ""
-    if not captured_session or failed_event or proc.returncode:
-        return int(proc.returncode or 1), ""
-    result = "".join(final_parts)
-    if final_truncated:
-        result = result[:_MAX_RESULT_CHARS - 3] + "..."
-    return 0, _bounded_text(result)
-
-
-
 
 def _worker_opencode(
     exe: str,
@@ -2208,11 +1497,6 @@ def _worker(task_id: str, jobs_root: Path) -> int:
         return 2
     contract = request["contract"]
     backend_name = str(request.get("backend") or "")
-    remote_mode = request.get("remote_mode") is True
-    if remote_mode and backend_name != "opencode":
-        meta.update({"state": "failed", "outcome": "failed", "ended_at": _now(), "error": "remote mode is unsupported for this runner"})
-        _atomic_json(meta_path, meta)
-        return 2
     timeout = max(10, min(int(request.get("timeout") or 900), 3600))
     request_root_raw = request.get("hermes_root")
     request_root = Path(str(request_root_raw)).expanduser() if request_root_raw else None
@@ -2259,7 +1543,7 @@ def _worker(task_id: str, jobs_root: Path) -> int:
                 task_id,
                 "cancelled" if cancelled else state,
                 returncode=rc,
-                summary=error or (meta.get("remote_result", "") if remote_mode else ""),
+                summary=error,
                 hermes_root=jobs_root.parent,
             )
         except FileNotFoundError:
@@ -2279,28 +1563,22 @@ def _worker(task_id: str, jobs_root: Path) -> int:
         if (jobs_root / f"{task_id}.cancel.json").exists():
             _terminalize(meta, state="cancelled")
             return 0
-        remote_result = ""
         if backend_name == "pi_rpc":
             rc, _ = _worker_pi(exe, contract, timeout, log_path, worker_hermes_root)
         elif backend_name == "opencode":
-            if remote_mode:
-                if not _opencode_remote_enabled():
-                    raise _OpenCodeRemoteError("OpenCode remote mode is no longer enabled")
-                rc, remote_result = _worker_opencode_remote(exe, contract, timeout, log_path, meta_path)
-            else:
-                rc, _ = _worker_opencode(exe, contract, timeout, log_path, worker_hermes_root)
+            rc, _ = _worker_opencode(exe, contract, timeout, log_path, worker_hermes_root)
         elif backend_name == "omx":
             rc, _ = _worker_omx(exe, contract, timeout, log_path)
         else:
             raise RuntimeError(f"local worker does not support backend {backend_name}")
         meta["returncode"] = rc
-        if remote_mode and rc == 0 and remote_result:
-            meta["remote_result"] = _bounded_text(remote_result)
         if rc == 0:
             _terminalize(meta, state="completed", rc=rc)
         else:
             _terminalize(meta, state="failed", rc=rc, error="runner timed out" if rc == 124 else f"runner exited with code {rc}")
-        # A bounded remote reply is a display result only, never contract evidence.
+        # Completion evidence is state/exit metadata only. Do not persist the
+        # model's final text in the runner store; contract validation must not
+        # depend on worker self-report or retain prompt-derived output.
         return rc
     except Exception as exc:  # noqa: BLE001
         _terminalize(meta, state="failed", error=_bounded_text(exc, 500))
