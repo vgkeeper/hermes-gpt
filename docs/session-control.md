@@ -68,6 +68,13 @@ The new session id is generated before the CLI starts, so the returned `session_
 is always the id of the freshly created session. Profile is restricted through the
 same policy as `hermes_session_continue` (no arbitrary profile names); a failed
 session-store write returns `SESSION_CREATE_FAILED` without launching anything.
+The profile is checked by the shared Operator session-profile policy before the
+first Hermes API request. Configure an explicit comma-separated list with
+`HERMES_GPT_OPERATOR_ALLOWED_PROFILES` (for example,
+`default,work-pro`); if the variable is unset or blank, only `default` is allowed.
+New session surfaces must apply this same check before making API requests. See
+[Operator Mode](operator-mode.md#hermes-profile-allowlist) for the security
+semantics and restart guidance.
 
 ## Bounds and persistence
 

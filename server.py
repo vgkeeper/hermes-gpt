@@ -1650,6 +1650,9 @@ def hermes_session_create(
     if isinstance(checked, dict):
         return checked
     safe_prompt, safe_timeout, safe_profile, safe_title, safe_mission_id = checked
+    # Keep creation on the same profile policy as continuation and Bot Chat.
+    # This must run before constructing the API client or making either API call.
+    safe_profile = _validate_session_profile(safe_profile)
     reservation = None
     session_id = ""
     try:
