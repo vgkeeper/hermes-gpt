@@ -1525,9 +1525,162 @@ def test_profile_aware_session_tools_expose_profile_parameter():
         server.hermes_session_read,
         server.hermes_session_export,
         server.hermes_bot_chat_get,
+        server.hermes_session_job_status,
+        server.hermes_session_job_wait,
+        server.hermes_session_job_result,
     ):
         parameter = inspect.signature(func).parameters["profile"]
         assert parameter.default == "default"
+
+
+def test_session_job_tools_list_exposes_profile_over_http(monkeypatch):
+    clear_gate_envs(monkeypatch)
+    monkeypatch.setenv(server.ENABLE_SESSION_SEARCH_ENV, "1")
+    monkeypatch.setenv(server.ENABLE_SESSION_CONTROL_ENV, "1")
+    app = server.build_asgi_app(server.build_server(http=True), http=True)
+
+    with TestClient(app, base_url="http://localhost") as client:
+        response = client.post(
+            "/mcp",
+            headers={
+                "Accept": "application/json, text/event-stream",
+                "MCP-Protocol-Version": "2025-11-25",
+            },
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+        )
+
+    assert response.status_code == 200
+    tools = {tool["name"]: tool for tool in response.json()["result"]["tools"]}
+    for name in (
+        "hermes_session_job_status",
+        "hermes_session_job_wait",
+        "hermes_session_job_result",
+    ):
+        profile = tools[name]["inputSchema"]["properties"]["profile"]
+        assert profile["default"] == "default"
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "extra_args"),
+    [
+        ("hermes_session_job_status", {}),
+        ("hermes_session_job_wait", {"wait_seconds": 0}),
+        ("hermes_session_job_result", {}),
+    ],
+)
+def test_session_job_tools_route_allowed_profile_to_api(
+    monkeypatch, tmp_path, tool_name, extra_args
+):
+    root = tmp_path / "hermes"
+    (root / "profiles" / "work-pro").mkdir(parents=True)
+    monkeypatch.setattr(server, "_default_hermes_root", lambda: root)
+    monkeypatch.setenv(server.op_policy.OPERATOR_ALLOWED_PROFILES_ENV, "default,work-pro")
+    calls = []
+
+    class Client:
+        def get_run(self, job_id, *, profile):
+            calls.append((job_id, profile))
+            return {"run_id": job_id, "status": "completed", "output": "OK"}
+
+    monkeypatch.setattr(server, "HermesAPIClient", Client)
+    result = getattr(server, tool_name)("run_work_pro", profile="work-pro", **extra_args)
+
+    assert result["success"] is True
+    assert result["profile"] == "work-pro"
+    assert result["status"] == "completed"
+    assert calls == [("run_work_pro", "work-pro")]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "extra_args"),
+    [
+        ("hermes_session_job_status", {}),
+        ("hermes_session_job_wait", {"wait_seconds": 0}),
+        ("hermes_session_job_result", {}),
+    ],
+)
+def test_session_job_tools_default_to_default_when_allowlist_is_unset(
+    monkeypatch, tmp_path, tool_name, extra_args
+):
+    monkeypatch.setattr(server, "_default_hermes_root", lambda: tmp_path)
+    monkeypatch.delenv(server.op_policy.OPERATOR_ALLOWED_PROFILES_ENV, raising=False)
+    calls = []
+
+    class Client:
+        def get_run(self, job_id, *, profile):
+            calls.append((job_id, profile))
+            return {"run_id": job_id, "status": "completed", "output": "OK"}
+
+    monkeypatch.setattr(server, "HermesAPIClient", Client)
+    result = getattr(server, tool_name)("run_default", **extra_args)
+
+    assert result["profile"] == "default"
+    assert calls == [("run_default", "default")]
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "hermes_session_job_status",
+        "hermes_session_job_wait",
+        "hermes_session_job_result",
+    ],
+)
+def test_session_job_tools_reject_unallowed_profile_before_api(
+    monkeypatch, tmp_path, tool_name
+):
+    root = tmp_path / "hermes"
+    monkeypatch.setattr(server, "_default_hermes_root", lambda: root)
+    monkeypatch.setenv(server.op_policy.OPERATOR_ALLOWED_PROFILES_ENV, "default")
+    client_constructions = []
+
+    class Client:
+        def __init__(self):
+            client_constructions.append(True)
+
+    monkeypatch.setattr(server, "HermesAPIClient", Client)
+    result = getattr(server, tool_name)("run_denied", profile="definitely-not-authorized")
+
+    assert result["success"] is False
+    assert client_constructions == []
+
+
+def test_session_job_tools_preserve_legacy_non_api_dispatch(monkeypatch, tmp_path):
+    root = tmp_path / "hermes"
+    monkeypatch.setattr(server, "_default_hermes_root", lambda: root)
+    calls = []
+
+    monkeypatch.setattr(
+        server.op_session,
+        "hermes_session_job_status",
+        lambda job_id, hermes_root: calls.append(("status", job_id, hermes_root)) or {},
+    )
+    monkeypatch.setattr(
+        server.op_session,
+        "hermes_session_job_wait",
+        lambda job_id, wait_seconds, hermes_root: calls.append(
+            ("wait", job_id, wait_seconds, hermes_root)
+        )
+        or {},
+    )
+    monkeypatch.setattr(
+        server.op_session,
+        "hermes_session_job_result",
+        lambda job_id, max_chars, hermes_root: calls.append(
+            ("result", job_id, max_chars, hermes_root)
+        )
+        or {},
+    )
+
+    server.hermes_session_job_status("legacy_job", profile="work-pro")
+    server.hermes_session_job_wait("legacy_job", wait_seconds=9, profile="work-pro")
+    server.hermes_session_job_result("legacy_job", max_chars=42, profile="work-pro")
+
+    assert calls == [
+        ("status", "legacy_job", root),
+        ("wait", "legacy_job", 9, root),
+        ("result", "legacy_job", 42, root),
+    ]
 
 
 def test_profile_aware_session_adapter_uses_named_profile_state_db(monkeypatch, tmp_path):

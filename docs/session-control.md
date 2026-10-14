@@ -36,8 +36,20 @@ runtime with shared-state disabled can still write a false orphan marker.
 1. Find a session ID with `hermes_session_list` when history is enabled.
 2. Call `hermes_session_continue(session_id, prompt, max_job_runtime_seconds, mission_id)` or its `hermes_session_send` alias. `mission_id` is optional; `hermes_session_create` accepts it too because it also creates an asynchronous job.
 3. Save the returned `job_id`.
-4. Poll `hermes_session_job_status(job_id)` until the status is `completed`, `failed`, `timed_out`, or `orphaned`.
-5. Call `hermes_session_job_result(job_id)` for the bounded, redacted final output.
+4. Poll `hermes_session_job_status(job_id, profile=session_profile)` until the status is `completed`, `failed`, `timed_out`, or `orphaned`.
+5. Call `hermes_session_job_result(job_id, profile=session_profile)` for the bounded, redacted final output.
+
+The `profile` argument is optional and defaults to `default`. Pass the same
+profile used to create or continue the session on every status, wait, and result
+call. This lets API-backed jobs in a named profile use that profile's Hermes
+API namespace; legacy local job IDs continue through the legacy job store.
+For example:
+
+```text
+hermes_session_job_wait(job_id="run_example", profile="work-pro", wait_seconds=120)
+hermes_session_job_result(job_id="run_example", profile="work-pro")
+hermes_session_job_status(job_id="run_example", profile="work-pro")
+```
 
 The start call resolves exact or unique-prefix IDs through Hermes' existing read-only `SessionDB` API before launching anything. It starts `operator_session_worker.py` with a private configuration payload over stdin (the prompt is not stored in job metadata), then the worker invokes the CLI with a fixed argument array equivalent to:
 
@@ -62,7 +74,7 @@ No shell is used. Hermes restores the resumed session's recorded working directo
 
 3. The call returns immediately with `success`, `session_id`, `job_id`, `profile`
    and `status`.
-4. Follow with `hermes_session_job_wait(job_id)` then `hermes_session_job_result(job_id)`.
+4. Follow with `hermes_session_job_wait(job_id, profile="work-pro")` then `hermes_session_job_result(job_id, profile="work-pro")` when the session was created in `work-pro`. For `default`, omit `profile` or pass `profile="default"`.
 
 The new session id is generated before the CLI starts, so the returned `session_id`
 is always the id of the freshly created session. Profile is restricted through the
