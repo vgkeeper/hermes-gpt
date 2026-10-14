@@ -387,6 +387,18 @@ done stages (a re-advance returns current state as a no-op).
 | `hermes_oauth_revoke` | owner | direct + confirm (pending legal) | every call | n/a |
 | `hermes_swarm_reconcile` | workspace/owner | dry-run-first + apply | every call | n/a |
 
+### Hermes profile allowlist
+
+`HERMES_GPT_OPERATOR_ALLOWED_PROFILES` is a comma-separated allowlist of existing Hermes profiles used by Operator session surfaces. Profile names are validated and normalized by the existing profile policy. If the variable is unset or blank, the current default is `default` only; named profiles remain unavailable until explicitly listed.
+
+For example, to allow the default profile and the dedicated `work-pro` profile:
+
+```text
+HERMES_GPT_OPERATOR_ALLOWED_PROFILES=default,work-pro
+```
+
+Keep this list explicit and limited to profiles the Operator should access. This configuration does not need a wildcard: `*` would allow every existing profile and unnecessarily broaden access. A profile must both exist under the Hermes data root and appear in the allowlist. New session surfaces must use the shared `_validate_session_profile()` check before making Hermes API calls or accessing session data, so one surface cannot bypass the profile policy. Restart Hermes GPT after changing the service environment so the running process sees the new value.
+
 ## Session history and session control
 
 These surfaces are independent from the Operator level hierarchy and remain hidden unless their explicit legacy gates are enabled.

@@ -223,10 +223,22 @@ def test_parse_allowed_profiles_default():
 
 
 def test_parse_allowed_profiles_list():
-    assert op.parse_allowed_profiles("default,hermes-researcher") == [
+    assert op.parse_allowed_profiles("default,work-pro") == [
         "default",
-        "hermes-researcher",
+        "work-pro",
     ]
+
+
+def test_operator_policy_exposes_profiles_without_widening_other_authority(monkeypatch):
+    _clear_operator_envs(monkeypatch)
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PROFILES_ENV, "default,work-pro")
+
+    policy = op.OperatorPolicy()
+
+    assert policy.to_summary()["allowed_profiles"] == ["default", "work-pro"]
+    assert policy.level == "read_only"
+    assert policy.apply_mode == "dry_run"
+    assert policy.mutation_allowed is False
 
 
 def test_parse_allowed_profiles_star_allows_all():

@@ -986,10 +986,13 @@ def test_phase2_tools_are_gated_and_registered(monkeypatch):
     assert "hermes_session_lineage_export" not in names
 
 
-def test_session_continue_uses_official_api_and_routes_profile(monkeypatch):
+def test_session_continue_uses_official_api_and_routes_profile(monkeypatch, tmp_path):
     monkeypatch.setenv(server.ENABLE_SESSION_CONTROL_ENV, "1")
     monkeypatch.setattr(server, "_start_session_api_supervisor", lambda *args: True)
-    monkeypatch.setattr(server, "_validate_session_profile", lambda profile="default": profile)
+    root = tmp_path
+    (root / "profiles" / "project-manager").mkdir(parents=True)
+    monkeypatch.setattr(server, "_default_hermes_root", lambda: root)
+    monkeypatch.setenv(server.op_policy.OPERATOR_ALLOWED_PROFILES_ENV, "default,project-manager")
     seen = {}
 
     class Client:
@@ -1007,7 +1010,7 @@ def test_session_continue_uses_official_api_and_routes_profile(monkeypatch):
 def test_session_create_uses_api_session_then_run(monkeypatch):
     monkeypatch.setenv(server.ENABLE_SESSION_CONTROL_ENV, "1")
     monkeypatch.setattr(server, "_start_session_api_supervisor", lambda *args: True)
-    monkeypatch.setattr(server, "_validate_session_profile", lambda profile="default": profile)
+    monkeypatch.delenv(server.op_policy.OPERATOR_ALLOWED_PROFILES_ENV, raising=False)
     calls = []
 
     class Client:
@@ -1025,6 +1028,64 @@ def test_session_create_uses_api_session_then_run(monkeypatch):
                      ("run", "first work", "sess_new", "default")]
 
 
+def test_session_create_routes_explicitly_allowed_named_profile(monkeypatch, tmp_path):
+    monkeypatch.setenv(server.ENABLE_SESSION_CONTROL_ENV, "1")
+    monkeypatch.setenv(server.op_policy.OPERATOR_ALLOWED_PROFILES_ENV, "default,work-pro")
+    monkeypatch.setattr(server, "_default_hermes_root", lambda: tmp_path)
+    (tmp_path / "profiles" / "work-pro").mkdir(parents=True)
+    monkeypatch.setattr(server, "_start_session_api_supervisor", lambda *args: True)
+    monkeypatch.setattr(server, "_reserve_session_api_session", lambda *args: object())
+    calls = []
+
+    class Client:
+        def create_session(self, **kwargs):
+            calls.append(("create", kwargs))
+            return {"session_id": "sess_work_pro"}
+
+        def create_run(self, prompt, *, session_id, profile):
+            calls.append(("run", prompt, session_id, profile))
+            return {"run_id": "run_work_pro", "status": "running"}
+
+    monkeypatch.setattr(server, "HermesAPIClient", Client)
+    result = server.hermes_session_create("first work", profile="work-pro")
+
+    assert result["success"] is True
+    assert result["profile"] == "work-pro"
+    assert calls == [
+        ("create", {"title": None, "source": "hermes-gpt", "profile": "work-pro"}),
+        ("run", "first work", "sess_work_pro", "work-pro"),
+    ]
+
+
+def test_session_create_rejects_unallowed_profile_before_hermes_api(monkeypatch, tmp_path):
+    monkeypatch.setenv(server.ENABLE_SESSION_CONTROL_ENV, "1")
+    monkeypatch.setenv(server.op_policy.OPERATOR_ALLOWED_PROFILES_ENV, "default")
+    monkeypatch.setattr(server, "_default_hermes_root", lambda: tmp_path)
+    (tmp_path / "profiles" / "work-pro").mkdir(parents=True)
+    monkeypatch.setattr(server, "_reserve_session_api_session", lambda *args: object())
+    monkeypatch.setattr(server, "_start_session_api_supervisor", lambda *args: True)
+    api_calls = []
+    client_constructions = []
+
+    class Client:
+        def __init__(self):
+            client_constructions.append(True)
+
+        def create_session(self, **kwargs):
+            api_calls.append(("create_session", kwargs))
+            return {"session_id": "sess_denied"}
+
+        def create_run(self, prompt, *, session_id, profile):
+            api_calls.append(("create_run", prompt, session_id, profile))
+            return {"run_id": "run_denied", "status": "running"}
+
+    monkeypatch.setattr(server, "HermesAPIClient", Client)
+    with pytest.raises(PermissionError, match="not in the allowed profiles list"):
+        server.hermes_session_create("first work", profile="work-pro")
+    assert client_constructions == []
+    assert api_calls == []
+
+
 def test_session_create_disabled_without_env_gate(monkeypatch):
     monkeypatch.delenv(server.ENABLE_SESSION_CONTROL_ENV, raising=False)
     monkeypatch.setattr(server, "require_imports", lambda: None)
@@ -1032,10 +1093,13 @@ def test_session_create_disabled_without_env_gate(monkeypatch):
     assert result["code"] == "SESSION_CONTROL_DISABLED"
 
 
-def test_bot_chat_send_targets_current_tip_in_requested_profile(monkeypatch):
+def test_bot_chat_send_targets_current_tip_in_requested_profile(monkeypatch, tmp_path):
     monkeypatch.setenv(server.ENABLE_SESSION_SEARCH_ENV, "1")
     monkeypatch.setattr(server, "require_imports", lambda: None)
-    monkeypatch.setattr(server, "_validate_session_profile", lambda profile="default": profile)
+    root = tmp_path
+    (root / "profiles" / "project-manager").mkdir(parents=True)
+    monkeypatch.setattr(server, "_default_hermes_root", lambda: root)
+    monkeypatch.setenv(server.op_policy.OPERATOR_ALLOWED_PROFILES_ENV, "default,project-manager")
     connection = sqlite3.connect(":memory:")
     fake_db = _Phase1FakeSessionDB(
         connection,
